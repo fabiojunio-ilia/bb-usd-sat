@@ -3,7 +3,7 @@
 # Compute e definido por TARGET: dev = serverless (Free Edition), prd = classico (BB).
 # Deploy: databricks bundle deploy -t dev -p pessoal   /   -t prd -p <profile-bb>
 bundle:
-  name: SAT
+  name: sat-canary
 
 include:
   - resources/*.yml
@@ -35,7 +35,7 @@ variables:
   use_parallel_runs:
     default: "true"
   maxpages:
-    default: "10"
+    default: "100"
   timebetweencalls:
     default: "1"
   secrets_max_parallel_workspaces:
@@ -87,6 +87,9 @@ targets:
   # ---------------- PRD: classico (BB, Azure) ----------------
   prd:
     mode: production
+    presets:
+      name_prefix: "[canary] "     # separa visualmente do SAT atual do BB
+      trigger_pause_status: PAUSED  # canary sobe com schedules pausados
     workspace:
       host: https://adb-5248734954947264.4.azuredatabricks.net   # PRD (do sat.log)
       root_path: /Applications/${bundle.name}
@@ -94,11 +97,11 @@ targets:
       service_principal_name: ${var.run_as_sp}
     variables:
       catalog: usd_prd                # PRD (sat.log mostra usd_prd — confirmar)
-      analysis_schema: analysis_schema
-      run_as_sp: "TODO"               # TODO: Application ID do SP
-      spark_version: "15.4.x-scala2.12"   # TODO: confirmar LTS vigente
-      node_type_id: "Standard_E4ads_v6"
-      num_workers: 5
+      analysis_schema: analysis_canary   # schema proprio do canary (tabelas novas, vazias)
+      run_as_sp: "1eff7c5e-75cd-47c6-accf-febf25889c70"   # SP do BB (excecao: id nao-secreto, repo interno)
+      spark_version: "16.4.x-scala2.12"   # do job real do BB (LTS Photon)
+      node_type_id: "Standard_DS4_v2"      # do job real do BB
+      num_workers: 3                  # paridade com o job atual do BB
     resources:
       jobs:
         sat_initializer:
@@ -115,6 +118,13 @@ targets:
                 spark_version: ${var.spark_version}
                 runtime_engine: PHOTON
                 node_type_id: ${var.node_type_id}
+                azure_attributes:
+                  first_on_demand: 1
+                  availability: ON_DEMAND_AZURE
+                  spot_bid_max_price: -1
+                spark_env_vars:
+                  PYSPARK_PYTHON: /databricks/python3/bin/python3
+                enable_elastic_disk: true
         sat_driver:
           tasks:
             - task_key: "sat_driver"
@@ -129,6 +139,13 @@ targets:
                 spark_version: ${var.spark_version}
                 runtime_engine: PHOTON
                 node_type_id: ${var.node_type_id}
+                azure_attributes:
+                  first_on_demand: 1
+                  availability: ON_DEMAND_AZURE
+                  spot_bid_max_price: -1
+                spark_env_vars:
+                  PYSPARK_PYTHON: /databricks/python3/bin/python3
+                enable_elastic_disk: true
         sat_secrets:
           tasks:
             - task_key: "secrets_scanner"
@@ -143,3 +160,10 @@ targets:
                 spark_version: ${var.spark_version}
                 runtime_engine: PHOTON
                 node_type_id: ${var.node_type_id}
+                azure_attributes:
+                  first_on_demand: 1
+                  availability: ON_DEMAND_AZURE
+                  spot_bid_max_price: -1
+                spark_env_vars:
+                  PYSPARK_PYTHON: /databricks/python3/bin/python3
+                enable_elastic_disk: true

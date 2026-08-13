@@ -172,9 +172,9 @@ response = requests.get(
 
 exists = True
 
-if 'Security Analysis Tool [SAT]' in response.text:
+if 'Security Analysis Tool [SAT] - CANARY' in response.text:
     json_response = response.json()
-    filtered_dashboard = [d for d in json_response['dashboards'] if d['display_name'] == 'Security Analysis Tool [SAT]']
+    filtered_dashboard = [d for d in json_response['dashboards'] if d['display_name'] == 'Security Analysis Tool [SAT] - CANARY']
 
     dashboard_id = filtered_dashboard[0]['dashboard_id']
     print("Dashboard already exists")
@@ -214,7 +214,7 @@ with open(json_file_path) as json_file:
 
 json_string = json_string = json.dumps(json_data)
 
-BODY = {'display_name': 'Security Analysis Tool [SAT]','warehouse_id': json_['sql_warehouse_id'], 'serialized_dashboard': json_string, 'parent_path': f"{basePath()}/dashboards"}
+BODY = {'display_name': 'Security Analysis Tool [SAT] - CANARY','warehouse_id': json_['sql_warehouse_id'], 'serialized_dashboard': json_string, 'parent_path': f"{basePath()}/dashboards"}
 
 response = requests.post(
           'https://%s/api/2.0/lakeview/dashboards' % (DOMAIN),
