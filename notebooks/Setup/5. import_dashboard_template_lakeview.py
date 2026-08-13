@@ -170,17 +170,21 @@ response = requests.get(
           timeout=60
         )
 
-exists = True
+# Nome do dashboard derivado do schema: 'analysis_schema' canonico usa o nome
+# original (substitui o dashboard existente naquele workspace); qualquer outro
+# schema (ex. analysis_canary) gera nome proprio -> paralelo, nao apaga o de prod.
+_schema_short = json_['analysis_schema_name'].split('.')[-1]
+DASH_NAME = 'Security Analysis Tool [SAT]' if _schema_short == 'analysis_schema' else f'Security Analysis Tool [SAT] - {_schema_short}'
 
-if 'Security Analysis Tool [SAT] - CANARY' in response.text:
-    json_response = response.json()
-    filtered_dashboard = [d for d in json_response['dashboards'] if d['display_name'] == 'Security Analysis Tool [SAT] - CANARY']
+json_response = response.json()
+filtered_dashboard = [d for d in json_response.get('dashboards', []) if d['display_name'] == DASH_NAME]
+exists = len(filtered_dashboard) > 0
 
+if exists:
     dashboard_id = filtered_dashboard[0]['dashboard_id']
-    print("Dashboard already exists")
+    print(f"Dashboard already exists: {DASH_NAME}")
 else:
-    exists = False
-    print("Dashboard doesn't exist yet")           
+    print(f"Dashboard doesn't exist yet: {DASH_NAME}")
 
 
 # COMMAND ----------
@@ -214,7 +218,7 @@ with open(json_file_path) as json_file:
 
 json_string = json_string = json.dumps(json_data)
 
-BODY = {'display_name': 'Security Analysis Tool [SAT] - CANARY','warehouse_id': json_['sql_warehouse_id'], 'serialized_dashboard': json_string, 'parent_path': f"{basePath()}/dashboards"}
+BODY = {'display_name': DASH_NAME,'warehouse_id': json_['sql_warehouse_id'], 'serialized_dashboard': json_string, 'parent_path': f"{basePath()}/dashboards"}
 
 response = requests.post(
           'https://%s/api/2.0/lakeview/dashboards' % (DOMAIN),
