@@ -110,8 +110,6 @@ targets:
           tasks:
             - task_key: "sat_initializer"
               job_cluster_key: job_cluster
-              libraries:
-                - whl: ./lib/dbl_sat_sdk-0.1.51-py3-none-any.whl
           job_clusters:
             - job_cluster_key: job_cluster
               new_cluster: &classic_cluster
@@ -131,8 +129,6 @@ targets:
           tasks:
             - task_key: "sat_driver"
               job_cluster_key: job_cluster
-              libraries:
-                - whl: ./lib/dbl_sat_sdk-0.1.51-py3-none-any.whl
           job_clusters:
             - job_cluster_key: job_cluster
               new_cluster: *classic_cluster
@@ -140,8 +136,6 @@ targets:
           tasks:
             - task_key: "secrets_scanner"
               job_cluster_key: job_cluster
-              libraries:
-                - whl: ./lib/dbl_sat_sdk-0.1.51-py3-none-any.whl
           job_clusters:
             - job_cluster_key: job_cluster
               new_cluster: *classic_cluster
@@ -170,8 +164,6 @@ targets:
           tasks:
             - task_key: "sat_initializer"
               job_cluster_key: job_cluster
-              libraries:
-                - whl: ./lib/dbl_sat_sdk-0.1.51-py3-none-any.whl
           job_clusters:
             - job_cluster_key: job_cluster
               new_cluster: *classic_cluster
@@ -179,8 +171,6 @@ targets:
           tasks:
             - task_key: "sat_driver"
               job_cluster_key: job_cluster
-              libraries:
-                - whl: ./lib/dbl_sat_sdk-0.1.51-py3-none-any.whl
           job_clusters:
             - job_cluster_key: job_cluster
               new_cluster: *classic_cluster
@@ -188,8 +178,6 @@ targets:
           tasks:
             - task_key: "secrets_scanner"
               job_cluster_key: job_cluster
-              libraries:
-                - whl: ./lib/dbl_sat_sdk-0.1.51-py3-none-any.whl
           job_clusters:
             - job_cluster_key: job_cluster
               new_cluster: *classic_cluster
