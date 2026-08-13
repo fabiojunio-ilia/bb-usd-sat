@@ -60,4 +60,11 @@ if is_serverless:
     # Install the SDK wheel only, with --no-deps to avoid any PyPI resolution.
     subprocess.run([sys.executable, "-m", "pip", "install", "--no-deps", WHEEL_PATH], check=True)
 else:
-    subprocess.run([sys.executable, "-m", "pip", "install", "PyYAML", WHEEL_PATH], check=True)
+    subprocess.run([sys.executable, "-m", "pip", "install", "--no-deps", "PyYAML", WHEEL_PATH], check=True)
+
+# COMMAND ----------
+
+# Auth Azure (msal) offline: instala msal + PyJWT das wheels em lib/, sem rede nem PyPI.
+# cryptography (dep nativa) e assumida presente no DBR. Inofensivo em AWS (msal nunca e importado).
+subprocess.run([sys.executable, "-m", "pip", "install", "--no-deps", "--no-index",
+                "--find-links", getLibPath(), "msal", "pyjwt"], check=True)
