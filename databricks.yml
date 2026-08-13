@@ -1,14 +1,13 @@
 # Databricks Asset Bundle (Declarative Automation Bundles) do SAT no BB.
-# Bundle concreto e versionado: a config NÃO secreta vive aqui (fonte de verdade);
-# segredos continuam no secret scope, gerados pelo instalador em dabs/.
-# Deploy: databricks bundle deploy -t dev   /   databricks bundle deploy -t prd
+# Config NAO secreta vive aqui (fonte de verdade); segredos no secret scope.
+# Compute e definido por TARGET: dev = serverless (Free Edition), prd = classico (BB).
+# Deploy: databricks bundle deploy -t dev -p pessoal   /   -t prd -p <profile-bb>
 bundle:
   name: SAT
 
 include:
   - resources/*.yml
 
-# Arquivos do SAT enviados ao workspace junto com os notebooks.
 sync:
   include:
     - notebooks/**
@@ -19,23 +18,20 @@ sync:
 
 variables:
   catalog:
-    description: Catálogo Unity Catalog do SAT neste ambiente.
+    description: Catalogo Unity Catalog do SAT neste ambiente.
   analysis_schema:
-    description: Nome do schema do SAT dentro do catálogo.
+    description: Schema do SAT dentro do catalogo.
     default: analysis_schema
-  warehouse_id:
-    description: SQL Warehouse dos dashboards e do Permissions Analysis.
+  # Compute (usadas so no target classico/prd)
   run_as_sp:
-    description: Application ID do service principal que executa os jobs em produção.
+    default: ""
   spark_version:
-    description: Databricks Runtime (LTS) dos job clusters.
+    default: ""
   node_type_id:
-    description: Tipo de nó dos job clusters.
+    default: ""
   num_workers:
-    description: Workers por job cluster.
     default: 5
-  # Flags de execução NÃO secretas, parametrizadas por ambiente.
-  # Chegam aos notebooks como job parameters e o initialize sobrescreve o json_.
+  # Flags de execucao (nao secretas), parametrizadas por ambiente
   use_parallel_runs:
     default: "true"
   maxpages:
@@ -52,18 +48,43 @@ variables:
     default: "America/Sao_Paulo"
 
 targets:
+  # ---------------- DEV: serverless (Free Edition) ----------------
   dev:
     mode: development
     default: true
     workspace:
-      host: https://TODO-DEV-HOST            # TODO: host do workspace DEV
+      host: https://dbc-242e0db0-bd12.cloud.databricks.com
     variables:
-      catalog: usd_dsv                        # DEV (do scaffold bb_usd_sat)
-      warehouse_id: "TODO"                    # TODO: warehouse DEV
-      run_as_sp: "TODO"                       # não usado em dev (roda como o usuário)
-      spark_version: "15.4.x-scala2.12"       # TODO: confirmar LTS vigente
-      node_type_id: "Standard_E4ads_v6"       # Azure, conforme diagnóstico
+      catalog: usd_dsv
+      analysis_schema: analysis_schema
+    resources:
+      jobs:
+        sat_initializer:
+          tasks:
+            - task_key: "sat_initializer"
+              environment_key: "default"
+          environments:
+            - environment_key: "default"
+              spec:
+                client: "5"
+        sat_driver:
+          tasks:
+            - task_key: "sat_driver"
+              environment_key: "default"
+          environments:
+            - environment_key: "default"
+              spec:
+                client: "5"
+        sat_secrets:
+          tasks:
+            - task_key: "secrets_scanner"
+              environment_key: "default"
+          environments:
+            - environment_key: "default"
+              spec:
+                client: "5"
 
+  # ---------------- PRD: classico (BB, Azure) ----------------
   prd:
     mode: production
     workspace:
@@ -72,8 +93,53 @@ targets:
     run_as:
       service_principal_name: ${var.run_as_sp}
     variables:
-      catalog: usd_prd                        # PRD (sat.log mostra usd_prd — confirmar)
-      warehouse_id: "TODO"                    # TODO: warehouse PRD
-      run_as_sp: "TODO"                       # TODO: Application ID do SP
-      spark_version: "15.4.x-scala2.12"       # TODO: confirmar LTS vigente
+      catalog: usd_prd                # PRD (sat.log mostra usd_prd — confirmar)
+      analysis_schema: analysis_schema
+      run_as_sp: "TODO"               # TODO: Application ID do SP
+      spark_version: "15.4.x-scala2.12"   # TODO: confirmar LTS vigente
       node_type_id: "Standard_E4ads_v6"
+      num_workers: 5
+    resources:
+      jobs:
+        sat_initializer:
+          tasks:
+            - task_key: "sat_initializer"
+              job_cluster_key: job_cluster
+              libraries:
+                - whl: ./lib/dbl_sat_sdk-0.1.51-py3-none-any.whl
+          job_clusters:
+            - job_cluster_key: job_cluster
+              new_cluster:
+                data_security_mode: SINGLE_USER
+                num_workers: ${var.num_workers}
+                spark_version: ${var.spark_version}
+                runtime_engine: PHOTON
+                node_type_id: ${var.node_type_id}
+        sat_driver:
+          tasks:
+            - task_key: "sat_driver"
+              job_cluster_key: job_cluster
+              libraries:
+                - whl: ./lib/dbl_sat_sdk-0.1.51-py3-none-any.whl
+          job_clusters:
+            - job_cluster_key: job_cluster
+              new_cluster:
+                data_security_mode: SINGLE_USER
+                num_workers: ${var.num_workers}
+                spark_version: ${var.spark_version}
+                runtime_engine: PHOTON
+                node_type_id: ${var.node_type_id}
+        sat_secrets:
+          tasks:
+            - task_key: "secrets_scanner"
+              job_cluster_key: job_cluster
+              libraries:
+                - whl: ./lib/dbl_sat_sdk-0.1.51-py3-none-any.whl
+          job_clusters:
+            - job_cluster_key: job_cluster
+              new_cluster:
+                data_security_mode: SINGLE_USER
+                num_workers: ${var.num_workers}
+                spark_version: ${var.spark_version}
+                runtime_engine: PHOTON
+                node_type_id: ${var.node_type_id}
