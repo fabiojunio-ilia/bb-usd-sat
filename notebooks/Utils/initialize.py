@@ -171,6 +171,40 @@ if cloud_type == "aws":
 
 # COMMAND ----------
 
+# DBTITLE 1,Overrides de ambiente via parametros do bundle (nao-secretos)
+# Config nao secreta pode chegar como job parameter do Databricks Asset Bundle
+# (Declarative Automation Bundles) e sobrescreve o default. Segredo continua vindo
+# do secret scope acima. Se rodar interativo, sem parametros, mantem o default.
+def _bundle_param(name):
+    try:
+        v = dbutils.widgets.get(name)
+        return v if v not in (None, "") else None
+    except Exception:
+        return None
+
+_ov = {k: _bundle_param(k) for k in (
+    "analysis_schema_name", "maxpages", "timebetweencalls",
+    "use_parallel_runs", "secrets_max_parallel_workspaces",
+)}
+for _k, _v in _ov.items():
+    if _v is not None:
+        json_[_k] = _v
+
+# widgets chegam como string: converte os numericos e o booleano
+for _k in ("maxpages", "timebetweencalls", "secrets_max_parallel_workspaces"):
+    if isinstance(json_.get(_k), str):
+        json_[_k] = int(json_[_k])
+if isinstance(json_.get("use_parallel_runs"), str):
+    json_["use_parallel_runs"] = json_["use_parallel_runs"].strip().lower() == "true"
+
+# re-deriva o intermediate_schema caso o catalogo/schema tenha mudado
+json_["intermediate_schema"] = (
+    f"{json_['analysis_schema_name'].split('.')[0]}.intermediate_schema"
+    if "." in json_["analysis_schema_name"] else "hive_metastore.intermediate_schema"
+)
+
+# COMMAND ----------
+
 
 from core.logging_utils import LoggingUtils
 
