@@ -1,0 +1,79 @@
+# Databricks Asset Bundle (Declarative Automation Bundles) do SAT no BB.
+# Bundle concreto e versionado: a config NÃO secreta vive aqui (fonte de verdade);
+# segredos continuam no secret scope, gerados pelo instalador em dabs/.
+# Deploy: databricks bundle deploy -t dev   /   databricks bundle deploy -t prd
+bundle:
+  name: SAT
+
+include:
+  - resources/*.yml
+
+# Arquivos do SAT enviados ao workspace junto com os notebooks.
+sync:
+  include:
+    - notebooks/**
+    - configs/**
+    - dashboards/**
+    - app/**
+    - lib/**
+
+variables:
+  catalog:
+    description: Catálogo Unity Catalog do SAT neste ambiente.
+  analysis_schema:
+    description: Nome do schema do SAT dentro do catálogo.
+    default: analysis_schema
+  warehouse_id:
+    description: SQL Warehouse dos dashboards e do Permissions Analysis.
+  run_as_sp:
+    description: Application ID do service principal que executa os jobs em produção.
+  spark_version:
+    description: Databricks Runtime (LTS) dos job clusters.
+  node_type_id:
+    description: Tipo de nó dos job clusters.
+  num_workers:
+    description: Workers por job cluster.
+    default: 5
+  # Flags de execução NÃO secretas, parametrizadas por ambiente.
+  # Chegam aos notebooks como job parameters e o initialize sobrescreve o json_.
+  use_parallel_runs:
+    default: "true"
+  maxpages:
+    default: "10"
+  timebetweencalls:
+    default: "1"
+  secrets_max_parallel_workspaces:
+    default: "4"
+  driver_schedule:
+    default: "0 0 8 ? * Mon,Wed,Fri"
+  secrets_scanner_schedule:
+    default: "0 0 10 ? * *"
+  job_timezone:
+    default: "America/Sao_Paulo"
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://TODO-DEV-HOST            # TODO: host do workspace DEV
+    variables:
+      catalog: usd_dsv                        # DEV (do scaffold bb_usd_sat)
+      warehouse_id: "TODO"                    # TODO: warehouse DEV
+      run_as_sp: "TODO"                       # não usado em dev (roda como o usuário)
+      spark_version: "15.4.x-scala2.12"       # TODO: confirmar LTS vigente
+      node_type_id: "Standard_E4ads_v6"       # Azure, conforme diagnóstico
+
+  prd:
+    mode: production
+    workspace:
+      host: https://adb-5248734954947264.4.azuredatabricks.net   # PRD (do sat.log)
+      root_path: /Applications/${bundle.name}
+    run_as:
+      service_principal_name: ${var.run_as_sp}
+    variables:
+      catalog: usd_prd                        # PRD (sat.log mostra usd_prd — confirmar)
+      warehouse_id: "TODO"                    # TODO: warehouse PRD
+      run_as_sp: "TODO"                       # TODO: Application ID do SP
+      spark_version: "15.4.x-scala2.12"       # TODO: confirmar LTS vigente
+      node_type_id: "Standard_E4ads_v6"

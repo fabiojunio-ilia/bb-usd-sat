@@ -1,0 +1,27 @@
+resources:
+  jobs:
+    sat_initializer:
+      name: "SAT Initializer Notebook (one-time)"
+      tags:
+        Application: SAT
+      tasks:
+        - task_key: "sat_initializer"
+          job_cluster_key: job_cluster
+          libraries:
+            - whl: ../lib/dbl_sat_sdk-0.1.51-py3-none-any.whl
+          notebook_task:
+            notebook_path: ${workspace.file_path}/notebooks/security_analysis_initializer
+            base_parameters:
+              analysis_schema_name: "${var.catalog}.${var.analysis_schema}"
+              maxpages: "${var.maxpages}"
+              timebetweencalls: "${var.timebetweencalls}"
+              use_parallel_runs: "${var.use_parallel_runs}"
+              secrets_max_parallel_workspaces: "${var.secrets_max_parallel_workspaces}"
+      job_clusters:
+        - job_cluster_key: job_cluster
+          new_cluster:
+            data_security_mode: SINGLE_USER
+            num_workers: ${var.num_workers}
+            spark_version: ${var.spark_version}
+            runtime_engine: "PHOTON"
+            node_type_id: ${var.node_type_id}
