@@ -1,6 +1,6 @@
 """Validators for Settings v2 API checks.
 
-Each setting uses its OWN top-level key in the response (documented in CLAUDE.md).
+Each setting uses its OWN top-level key in the response.
 Exception: sql_results_download uniquely uses 'boolean_val'.
 """
 

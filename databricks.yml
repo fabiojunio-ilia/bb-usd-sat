@@ -1,9 +1,9 @@
 # Databricks Asset Bundle (Declarative Automation Bundles) do SAT no BB.
 # Config NAO secreta vive aqui (fonte de verdade); segredos no secret scope.
-# Compute e definido por TARGET: dev = serverless (Free Edition), prd = classico (BB).
-# Deploy: databricks bundle deploy -t dev -p pessoal   /   -t prd -p <profile-bb>
+# Compute por TARGET: dev = serverless (Free Edition); bb_dev/bb_prd = classico (BB).
+# Deploy: bundle deploy -t bb_dev -p <perfil-dev-bb>  /  -t bb_prd -p <perfil-prd-bb>
 bundle:
-  name: sat-canary
+  name: SAT
 
 include:
   - resources/*.yml
@@ -15,6 +15,9 @@ sync:
     - dashboards/**
     - app/**
     - lib/**
+  exclude:            # docs de projeto nao vao ao workspace do cliente
+    - README.md
+    - CONTRIBUTING.md
 
 variables:
   catalog:
@@ -48,7 +51,7 @@ variables:
     default: "America/Sao_Paulo"
 
 targets:
-  # ---------------- DEV: serverless (Free Edition) ----------------
+  # ---------------- DEV pessoal: serverless (Free Edition) ----------------
   dev:
     mode: development
     default: true
@@ -84,24 +87,23 @@ targets:
               spec:
                 client: "5"
 
-  # ---------------- PRD: classico (BB, Azure) ----------------
-  prd:
+  # ---------------- BB DEV: classico (workspace de dev do BB) ----------------
+  bb_dev:
     mode: production
     presets:
-      name_prefix: "[canary] "     # separa visualmente do SAT atual do BB
-      trigger_pause_status: PAUSED  # canary sobe com schedules pausados
+      trigger_pause_status: PAUSED   # dispara manual no dev; sem prefixo canary (vai substituir o SAT de dev)
     workspace:
-      host: https://adb-5248734954947264.4.azuredatabricks.net   # PRD (do sat.log)
+      host: https://adb-7405614144903883.3.azuredatabricks.net
       root_path: /Applications/${bundle.name}
     run_as:
       service_principal_name: ${var.run_as_sp}
     variables:
-      catalog: usd_prd                # PRD (sat.log mostra usd_prd — confirmar)
-      analysis_schema: analysis_canary   # schema proprio do canary (tabelas novas, vazias)
-      run_as_sp: "1eff7c5e-75cd-47c6-accf-febf25889c70"   # SP do BB (excecao: id nao-secreto, repo interno)
-      spark_version: "16.4.x-scala2.12"   # do job real do BB (LTS Photon)
-      node_type_id: "Standard_DS4_v2"      # do job real do BB
-      num_workers: 3                  # paridade com o job atual do BB
+      catalog: usd_des                # catalogo do DEV do BB
+      analysis_schema: analysis_schema
+      run_as_sp: "40df3399-4034-4690-8d17-a67031821dc2"   # SP do dev do BB
+      spark_version: "16.4.x-scala2.12"
+      node_type_id: "Standard_DS4_v2"
+      num_workers: 3
     resources:
       jobs:
         sat_initializer:
@@ -112,7 +114,7 @@ targets:
                 - whl: ./lib/dbl_sat_sdk-0.1.51-py3-none-any.whl
           job_clusters:
             - job_cluster_key: job_cluster
-              new_cluster:
+              new_cluster: &classic_cluster
                 data_security_mode: SINGLE_USER
                 num_workers: ${var.num_workers}
                 spark_version: ${var.spark_version}
@@ -133,19 +135,7 @@ targets:
                 - whl: ./lib/dbl_sat_sdk-0.1.51-py3-none-any.whl
           job_clusters:
             - job_cluster_key: job_cluster
-              new_cluster:
-                data_security_mode: SINGLE_USER
-                num_workers: ${var.num_workers}
-                spark_version: ${var.spark_version}
-                runtime_engine: PHOTON
-                node_type_id: ${var.node_type_id}
-                azure_attributes:
-                  first_on_demand: 1
-                  availability: ON_DEMAND_AZURE
-                  spot_bid_max_price: -1
-                spark_env_vars:
-                  PYSPARK_PYTHON: /databricks/python3/bin/python3
-                enable_elastic_disk: true
+              new_cluster: *classic_cluster
         sat_secrets:
           tasks:
             - task_key: "secrets_scanner"
@@ -154,16 +144,52 @@ targets:
                 - whl: ./lib/dbl_sat_sdk-0.1.51-py3-none-any.whl
           job_clusters:
             - job_cluster_key: job_cluster
-              new_cluster:
-                data_security_mode: SINGLE_USER
-                num_workers: ${var.num_workers}
-                spark_version: ${var.spark_version}
-                runtime_engine: PHOTON
-                node_type_id: ${var.node_type_id}
-                azure_attributes:
-                  first_on_demand: 1
-                  availability: ON_DEMAND_AZURE
-                  spot_bid_max_price: -1
-                spark_env_vars:
-                  PYSPARK_PYTHON: /databricks/python3/bin/python3
-                enable_elastic_disk: true
+              new_cluster: *classic_cluster
+
+  # ---------------- BB PRD: classico (workspace de prd do BB) ----------------
+  bb_prd:
+    mode: production
+    presets:
+      name_prefix: "[canary] "      # paralelo ao SAT atual do BB
+      trigger_pause_status: PAUSED
+    workspace:
+      host: https://adb-5248734954947264.4.azuredatabricks.net
+      root_path: /Applications/sat_canary
+    run_as:
+      service_principal_name: ${var.run_as_sp}
+    variables:
+      catalog: usd_prd
+      analysis_schema: analysis_canary   # schema proprio do canary (nao toca o SAT atual)
+      run_as_sp: "1eff7c5e-75cd-47c6-accf-febf25889c70"   # SP de prd do BB
+      spark_version: "16.4.x-scala2.12"
+      node_type_id: "Standard_DS4_v2"
+      num_workers: 3
+    resources:
+      jobs:
+        sat_initializer:
+          tasks:
+            - task_key: "sat_initializer"
+              job_cluster_key: job_cluster
+              libraries:
+                - whl: ./lib/dbl_sat_sdk-0.1.51-py3-none-any.whl
+          job_clusters:
+            - job_cluster_key: job_cluster
+              new_cluster: *classic_cluster
+        sat_driver:
+          tasks:
+            - task_key: "sat_driver"
+              job_cluster_key: job_cluster
+              libraries:
+                - whl: ./lib/dbl_sat_sdk-0.1.51-py3-none-any.whl
+          job_clusters:
+            - job_cluster_key: job_cluster
+              new_cluster: *classic_cluster
+        sat_secrets:
+          tasks:
+            - task_key: "secrets_scanner"
+              job_cluster_key: job_cluster
+              libraries:
+                - whl: ./lib/dbl_sat_sdk-0.1.51-py3-none-any.whl
+          job_clusters:
+            - job_cluster_key: job_cluster
+              new_cluster: *classic_cluster
