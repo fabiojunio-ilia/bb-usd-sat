@@ -540,19 +540,22 @@ def _list_dir(path: str) -> List[Dict[str, Any]]:
 
     404 is normal for tree roots that don't exist on every workspace
     (e.g. /Repos on workspaces without Git integration).
+
+    Uses _get_with_retry so an HTTP 429 is retried with exponential backoff
+    instead of silently dropping the whole subtree from the scan. Recursive
+    discovery bursts many list calls in quick succession, which is exactly
+    when workspace rate limits trigger.
     """
     url = f"{base_url}/api/2.0/workspace/list?path={quote(path)}"
-    headers = {"Authorization": f"Bearer {token}", "User-Agent": "databricks-sat/0.1.0"}
-    try:
-        r = requests.get(url, headers=headers, timeout=30)
-        if r.status_code != 200:
-            if r.status_code != 404:
-                logger.warning(f"workspace/list returned {r.status_code} for {path}")
-            return []
-        return r.json().get("objects", [])
-    except requests.exceptions.RequestException as e:
-        logger.warning(f"workspace/list failed for {path}: {str(e)}")
+    r = _get_with_retry(url, f"workspace/list {path}")
+    if r is None:
+        logger.warning(f"workspace/list failed for {path} (no response)")
         return []
+    if r.status_code != 200:
+        if r.status_code != 404:
+            logger.warning(f"workspace/list returned {r.status_code} for {path}")
+        return []
+    return r.json().get("objects", [])
 
 
 def discover_notebooks_via_workspace_list(time_filter_enabled: bool,
