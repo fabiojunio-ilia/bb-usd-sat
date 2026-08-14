@@ -143,11 +143,14 @@ targets:
   # ---------------- BB PRD: classico (workspace de prd do BB) ----------------
   bb_prd:
     mode: production
+    permissions:
+      - level: CAN_MANAGE
+        group_name: SLNUSDLG      # grupo USD: ve e gerencia os jobs do canary
     presets:
       name_prefix: "[canary] "      # paralelo ao SAT atual do BB
       trigger_pause_status: PAUSED
     workspace:
-      host: https://adb-5248734954947264.4.azuredatabricks.net
+      host: https://adb-7405606395020160.0.azuredatabricks.net
       root_path: /Applications/sat_canary
     run_as:
       service_principal_name: ${var.run_as_sp}
