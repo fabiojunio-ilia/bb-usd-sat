@@ -203,6 +203,20 @@ json_["intermediate_schema"] = (
     if "." in json_["analysis_schema_name"] else "hive_metastore.intermediate_schema"
 )
 
+# Fail-closed: em execucao de job do bundle o schema DEVE vir por parametro.
+# Sem widget, o valor acima veio do secret scope — que pode apontar para o
+# schema de OUTRA instalacao (ex.: producao). Falhar aqui e barato; escrever
+# no schema errado nao e.
+if _ov.get("analysis_schema_name") is None:
+    import os as _os
+    if _os.environ.get("SAT_ALLOW_SCOPE_SCHEMA", "").lower() != "true":
+        raise Exception(
+            "analysis_schema_name nao foi informado por parametro (widget). "
+            "Rode via job do bundle, ou passe o widget manualmente, ou defina "
+            "SAT_ALLOW_SCOPE_SCHEMA=true para aceitar conscientemente o valor do scope: "
+            f"{json_['analysis_schema_name']}"
+        )
+
 # COMMAND ----------
 
 

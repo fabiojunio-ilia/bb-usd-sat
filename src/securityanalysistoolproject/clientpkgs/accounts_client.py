@@ -2,6 +2,7 @@
 from core.dbclient import SatDBClient
 import clientpkgs.azure_accounts_client as azfunc
 from core.logging_utils import LoggingUtils
+LOGGR = LoggingUtils.get_logger()
 #account_provisioning_client has the same methods as accounts_client
 # deprecate this at some point.
 
@@ -11,13 +12,85 @@ class AccountsClient(SatDBClient):
     subslist=[]
     def get_workspace_list(self):
         """
-        Returns an array of json objects for workspace
+        Returns an array of json objects for workspace.
+
+        Azure: hybrid discovery. The canonical list comes from the Databricks
+        Account Console API (cross-subscription -- ARM listing was limited to
+        the single subscription in `subscription-id`, hiding workspaces that
+        live in other subscriptions). Each workspace is then enriched with the
+        ARM record (network, encryption, sku, resource id) for every
+        subscription the SP can read; workspaces without ARM access keep the
+        base fields and null enrichment, which downstream checks already
+        tolerate (`WHERE field is not null`). Falls back to the legacy
+        single-subscription ARM path if the Account API is unavailable.
         """
         workspaces_list=[]
         if self._cloud_type=='azure':
-            if bool(self.subslist) is False:
-                self.subslist = self.get_azure_subscription_list()
-            workspaces_list = azfunc.remap_workspace_list(self.subslist)
+            acct_list = []
+            try:
+                accountid = self._account_id
+                acct_list = self.get(f"/accounts/{accountid}/workspaces",
+                                     master_acct=True).get('satelements', [])
+            except Exception as e:
+                LOGGR.warning(f"Account API workspace listing failed ({e}); "
+                              "falling back to single-subscription ARM discovery")
+
+            if not acct_list:
+                # Legacy behavior: ARM listing of the configured subscription only.
+                if bool(self.subslist) is False:
+                    self.subslist = self.get_azure_subscription_list()
+                return azfunc.remap_workspace_list(self.subslist)
+
+            # ARM enrichment across every subscription seen in the account list
+            # (plus the configured one), skipping those without Reader access.
+            sub_ids = {self._subscription_id}
+            for ws in acct_list:
+                sub = (ws.get('azure_workspace_info') or {}).get('subscription_id')
+                if sub:
+                    sub_ids.add(sub)
+
+            arm_by_wsid = {}
+            arm_records = []
+            for sub in sorted(s for s in sub_ids if s):
+                try:
+                    sub_ws = self.get(
+                        f"/subscriptions/{sub}/providers/Microsoft.Databricks/workspaces?api-version=2018-04-01",
+                        master_acct=True).get('value', [])
+                    arm_records.extend(sub_ws)
+                    for rec in azfunc.remap_workspace_list(sub_ws):
+                        arm_by_wsid[str(rec.get('workspace_id'))] = rec
+                except Exception as e:
+                    LOGGR.warning(f"ARM enrichment skipped for subscription {sub}: {e}")
+            self.subslist = arm_records  # preserve raw ARM records for reuse
+
+            for ws in acct_list:
+                wsid = str(ws.get('workspace_id'))
+                enriched = arm_by_wsid.get(wsid)
+                if enriched is not None:
+                    workspaces_list.append(enriched)
+                else:
+                    # Base record from the Account API only (no ARM access).
+                    workspaces_list.append({
+                        'account_id': ws.get('account_id', ''),
+                        'workspace_id': ws.get('workspace_id'),
+                        'workspace_name': ws.get('workspace_name'),
+                        'deployment_name': ws.get('deployment_name'),
+                        'workspace_status': ws.get('workspace_status'),
+                        'region': ws.get('location'),
+                        'aws_region': ws.get('location'),
+                        'creation_time': ws.get('creation_time'),
+                        'pricing_tier': ws.get('pricing_tier'),
+                        'workspace_url': f"{ws.get('deployment_name')}.azuredatabricks.net"
+                                         if ws.get('deployment_name') else None,
+                        'private_access_settings_id': None,
+                        'network_id': None,
+                        'network_id_pvtsubnet': None,
+                        'enableFedRampCertification': None,
+                        'enableNoPublicIp': None,
+                        'prepareEncryption': None,
+                        'relayNamespaceName': None,
+                        'requireInfrastructureEncryption': None,
+                    })
         else:
             accountid=self._account_id
             workspaces_list = self.get(f"/accounts/{accountid}/workspaces", master_acct=True).get('satelements',[])
