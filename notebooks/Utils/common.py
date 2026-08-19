@@ -5,6 +5,23 @@
 
 # COMMAND ----------
 
+# Schemas minimos para colecoes que legitimamente podem vir vazias (workspace
+# sem PATs, sem IP access list, sem mounts etc.). Sem isso a tabela nao e criada
+# e o check correspondente falha com "view not found" em vez de avaliar como
+# conforme com zero achados. "Nao avaliado" e "sem risco" sao coisas diferentes
+# num relatorio de seguranca. Colunas = as referenciadas pelos checks.
+EMPTY_COLLECTION_SCHEMAS = {
+    'tokens': 'comment string, created_by_username string, token_id string, expiry_time bigint',
+    'ipaccesslist': 'label string, list_type string, enabled boolean',
+    'dbfssettingsdirs': 'path string',
+    'dbfssettingsmounts': 'path string',
+    'globalscripts': 'name string, created_by string, enabled boolean',
+    'legacyinitscripts': 'path string, is_dir boolean',
+    'vector_search_endpoint_list': 'name string, endpoint_type string',
+    'account_ipaccess_list': 'label string, list_type string, address_count int, enabled boolean',
+}
+
+
 def bootstrap(viewname, func, **kwargs):
     """bootstrap with function and store resulting dataframe as a global temp view
     if the function doesn't return a value, creates an empty dataframe and corresponding view
@@ -29,9 +46,15 @@ def bootstrap(viewname, func, **kwargs):
             apiDF = apiDF.select(from_json(col("json_string"), process_json_schema(apiDF)).alias("data")).select("data.*")
             #display(apiDF)
         else:
-            apiDF = spark.createDataFrame([], StructType([]))
-            loggr.info("No Results!")
-        if len(apiDF.take(1)) > 0:
+            _base = viewname.rsplit('_', 1)[0] if viewname.rsplit('_', 1)[-1].isdigit() else viewname
+            _ddl = EMPTY_COLLECTION_SCHEMAS.get(_base)
+            if _ddl:
+                apiDF = spark.createDataFrame([], _ddl)
+                loggr.info(f"No results; creating empty `{viewname}` with schema so checks evaluate on zero rows")
+            else:
+                apiDF = spark.createDataFrame([], StructType([]))
+                loggr.info("No Results!")
+        if len(apiDF.take(1)) > 0 or len(apiDF.schema) > 0:
             apiDF.write.option("delta.columnMapping.mode", "name").mode("overwrite").saveAsTable(viewname)
             loggr.info(f"Table created: `{viewname}`")
     except Exception:
@@ -133,31 +156,65 @@ def sqldisplay(sqlstr):
 # COMMAND ----------
 
 
+# --- Gravacao em lote (v1) -------------------------------------------------
+# Antes: cada check fazia 1 SELECT max(runID) + 1 INSERT de 1 linha (~200
+# micro-transacoes Delta por workspace). Agora: run_id e lido uma vez e os
+# resultados acumulam em memoria; flushControlTables() grava 1 lote por tabela.
+# Chamado no fim de cada notebook de analise; como rede de protecao, o buffer
+# tambem descarrega sozinho a cada _FLUSH_THRESHOLD linhas.
+_pending_checks = []
+_pending_info = []
+_cached_run_id = None
+_FLUSH_THRESHOLD = 200
+
+
+def _get_run_id():
+    global _cached_run_id
+    if _cached_run_id is None:
+        _cached_run_id = spark.sql(
+            f'select max(runID) from {json_["analysis_schema_name"]}.run_number_table'
+        ).collect()[0][0]
+    return _cached_run_id
+
+
+def flushControlTables():
+    """Grava em lote os resultados acumulados de checks e infos."""
+    global _pending_checks, _pending_info
+    if _pending_checks:
+        values = ",\n".join(
+            "('{}', '{}', cast({} as int), from_json('{}', 'MAP<STRING,STRING>'), {}, cast({} as timestamp))".format(*row)
+            for row in _pending_checks
+        )
+        spark.sql(
+            "INSERT INTO {}.`security_checks` (`workspaceid`, `id`, `score`, `additional_details`, `run_id`, `check_time`) VALUES {}".format(
+                json_["analysis_schema_name"], values))
+        loggr.info(f"flushControlTables: {len(_pending_checks)} check(s) gravados em lote")
+        _pending_checks = []
+    if _pending_info:
+        values = ",\n".join(
+            "('{}','{}', from_json('{}', 'MAP<STRING,STRING>'), '{}', '{}', cast({} as timestamp))".format(*row)
+            for row in _pending_info
+        )
+        spark.sql(
+            "INSERT INTO {}.`account_info` (`workspaceid`,`name`, `value`, `category`, `run_id`, `check_time`) VALUES {}".format(
+                json_["analysis_schema_name"], values))
+        loggr.info(f"flushControlTables: {len(_pending_info)} info(s) gravadas em lote")
+        _pending_info = []
+
+
 def insertIntoControlTable(workspace_id, id, score, additional_details):
     """
-    Insert results into a control table
-    :workspace_id workspace id for this check
-    :param str id id mapping to best practices config of the check
-    :param int score integer score based on violation
-    :param dictionary additional_details additional details of the check
+    Acumula resultado de check para gravacao em lote (ver flushControlTables).
     """
     import json
     import time
 
     ts = time.time()
-    # change this. Has to come via function.
-    # orgId = dbutils.notebook.entry_point.getDbutils().notebook().getContext().tags().get('orgId').getOrElse(None)
-    run_id = spark.sql(
-        f'select max(runID) from {json_["analysis_schema_name"]}.run_number_table'
-    ).collect()[0][0]
-    jsonstr = json.dumps(additional_details)
-    # Escape single quotes for SQL by doubling them
-    jsonstr = jsonstr.replace("'", "''")
-    sql = """INSERT INTO {}.`security_checks` (`workspaceid`, `id`, `score`, `additional_details`, `run_id`, `check_time`)
-            VALUES ('{}', '{}', cast({} as int),  from_json('{}', 'MAP<STRING,STRING>'), {}, cast({} as timestamp))""".format(
-        json_["analysis_schema_name"], workspace_id, id, score, jsonstr, run_id, ts
-    )
-    spark.sql(sql)
+    run_id = _get_run_id()
+    jsonstr = json.dumps(additional_details).replace("'", "''")
+    _pending_checks.append((workspace_id, id, score, jsonstr, run_id, ts))
+    if len(_pending_checks) >= _FLUSH_THRESHOLD:
+        flushControlTables()
 
 
 # COMMAND ----------
@@ -174,22 +231,13 @@ def insertIntoInfoTable(workspace_id, name, value, category):
     import time
 
     ts = time.time()
-    # change this. Has to come via function.
-    # orgId = dbutils.notebook.entry_point.getDbutils().notebook().getContext().tags().get('orgId').getOrElse(None)
-    run_id = spark.sql(
-        f'select max(runID) from {json_["analysis_schema_name"]}.run_number_table'
-    ).collect()[0][0]
-    jsonstr = json.dumps(value)
-    # Escape single quotes for SQL by doubling them
-    jsonstr = jsonstr.replace("'", "''")
+    run_id = _get_run_id()
+    jsonstr = json.dumps(value).replace("'", "''")
     safe_name = name.replace("'", "''")
     safe_category = category.replace("'", "''")
-    sql = """INSERT INTO {}.`account_info` (`workspaceid`,`name`, `value`, `category`, `run_id`, `check_time`)
-            VALUES ('{}','{}', from_json('{}', 'MAP<STRING,STRING>'), '{}', '{}', cast({} as timestamp))""".format(
-        json_["analysis_schema_name"], workspace_id, safe_name, jsonstr, safe_category, run_id, ts
-    )
-    ### print(sql)
-    spark.sql(sql)
+    _pending_info.append((workspace_id, safe_name, jsonstr, safe_category, run_id, ts))
+    if len(_pending_info) >= _FLUSH_THRESHOLD:
+        flushControlTables()
 
 
 # COMMAND ----------

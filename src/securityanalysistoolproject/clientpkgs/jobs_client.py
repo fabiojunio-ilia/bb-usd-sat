@@ -29,10 +29,12 @@ class JobsClient(SatDBClient):
         Each row is one (job, principal, permission_level) combination.
         job_list: list of Row objects with job_id and job_name fields.
         """
-        result = []
-        for row in job_list:
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _one(row):
             job_id = row.job_id
             job_name = row.job_name or ''
+            rows = []
             try:
                 acl = self.get(f"/permissions/jobs/{job_id}", version='2.0').get('access_control_list', [])
                 for entry in acl:
@@ -40,7 +42,7 @@ class JobsClient(SatDBClient):
                     user_name = entry.get('user_name') or ''
                     service_principal_name = entry.get('service_principal_name') or ''
                     for perm in entry.get('all_permissions', []):
-                        result.append({
+                        rows.append({
                             'job_id': str(job_id),
                             'job_name': job_name,
                             'group_name': group_name,
@@ -51,6 +53,21 @@ class JobsClient(SatDBClient):
                         })
             except Exception as e:
                 LOGGR.warning(f"Could not get permissions for job {job_id}: {e}")
+            return rows
+
+        # Era 1 chamada por job em serie (~0,3s x N jobs). Pool limitado de
+        # threads: o proprio tamanho do pool e o teto de concorrencia contra a
+        # API; 429 e tratado com backoff adaptativo no dbclient. A primeira
+        # chamada roda em serie para aquecer o token antes do fan-out.
+        result = []
+        job_list = list(job_list)
+        if not job_list:
+            return result
+        result.extend(_one(job_list[0]))
+        if len(job_list) > 1:
+            with ThreadPoolExecutor(max_workers=12) as pool:
+                for rows in pool.map(_one, job_list[1:]):
+                    result.extend(rows)
         return result
 
     def get_jobs_list(self):

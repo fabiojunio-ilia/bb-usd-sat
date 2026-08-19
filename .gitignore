@@ -28,7 +28,8 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
+lib/*
+!lib/*.whl
 lib64/
 parts/
 sdist/
