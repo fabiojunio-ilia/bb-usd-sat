@@ -1609,4 +1609,5 @@ if enabled and not is_serverless:
 
 # COMMAND ----------
 
+flushControlTables()  # grava o lote acumulado antes de sair
 dbutils.notebook.exit(f'Completed SAT workspace analysis in {tcomp} seconds')

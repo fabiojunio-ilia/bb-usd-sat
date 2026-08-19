@@ -12,15 +12,28 @@ class SecretsClient(SatDBClient):
         return scopes_list
 
     def get_secrets(self, scope_list):
-        '''get list of secrets'''
-        glob_secrets=[]
-        for iscope in scope_list:
+        '''get list of secrets (2 chamadas por scope, escopos em paralelo)'''
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _one(iscope):
+            out = []
             secrets_list = self.get('/secrets/list', {'scope': iscope['name']}).get('secrets', [])
             secrets_acl_list = self.get('/secrets/acls/list', {'scope': iscope['name']}).get('items', [])
             for isecret in secrets_list:
                 isecret['scope'] = iscope
-                isecret['acls']=secrets_acl_list
-                glob_secrets.append(isecret)
+                isecret['acls'] = secrets_acl_list
+                out.append(isecret)
+            return out
+
+        glob_secrets = []
+        scope_list = list(scope_list)
+        if not scope_list:
+            return glob_secrets
+        glob_secrets.extend(_one(scope_list[0]))  # aquece token em serie
+        if len(scope_list) > 1:
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                for out in pool.map(_one, scope_list[1:]):
+                    glob_secrets.extend(out)
         return glob_secrets
 
     def get_secret_value(self, scope_name, secret_key):

@@ -420,4 +420,5 @@ print(f"Workspace Settings - {tcomp} seconds to run")
 
 # COMMAND ----------
 
+flushControlTables()  # grava o lote acumulado antes de sair
 dbutils.notebook.exit(f'Completed SAT workspace settings in {tcomp} seconds')

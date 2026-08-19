@@ -1,6 +1,7 @@
 '''dbclient'''
 import json
 import time
+import random
 import urllib3
 import requests
 from core.logging_utils import LoggingUtils
@@ -295,6 +296,30 @@ class SatDBClient:
             LOGGR.debug(f"type-{type(flatarr_1[0])}") #flatten4-200-type-<class 'list'>-type-<class 'dict'>
         return flatelem, flatarr_1, flathttpstatuscode
     
+    def _get_with_throttle(self, endpoint, json_params):
+        """GET com throttle adaptativo: nao dorme em sucesso; em HTTP 429 faz
+        backoff exponencial com jitter (respeitando Retry-After quando presente)
+        e tenta de novo. Substitui o time.sleep incondicional por pagina --
+        dormir so quando a API sinaliza pressao. timebetweencalls vira a base
+        do backoff em vez de um custo fixo por chamada."""
+        base = max(float(self._timebetweencalls), 1.0)
+        max_attempts = 6
+        raw = None
+        for attempt in range(max_attempts):
+            raw = requests.get(endpoint, headers=self._token, params=json_params,
+                               timeout=60, proxies=self._proxies)
+            if raw.status_code != 429:
+                return raw
+            retry_after = raw.headers.get('Retry-After')
+            try:
+                wait = float(retry_after) if retry_after else base * (2 ** attempt)
+            except (TypeError, ValueError):
+                wait = base * (2 ** attempt)
+            wait += random.uniform(0, wait * 0.1)
+            LOGGR.warning(f"HTTP 429 (attempt {attempt+1}/{max_attempts}); backing off {wait:.1f}s")
+            time.sleep(wait)
+        return raw
+
     #return dictionary of elem and list of values
     def get_paginated(self, endpoint, reqtype="get", json_params=None, files_json=None, is_paginated=False):
         NUM_PAGES=10 #throttle as needed
@@ -303,8 +328,7 @@ class SatDBClient:
         for i in range(self._maxpages):
             LOGGR.debug(f"{endpoint}---{json_params}")
             if 'get' in reqtype:
-                raw_results = requests.get(endpoint, headers=self._token, params=json_params, timeout=60, proxies=self._proxies)
-                time.sleep(self._timebetweencalls) #throttle otherwise gives a too many requests error
+                raw_results = self._get_with_throttle(endpoint, json_params)
             elif 'post' in reqtype:
                 if json_params is None:
                     LOGGR.info("Must have a payload in json_args param.")
