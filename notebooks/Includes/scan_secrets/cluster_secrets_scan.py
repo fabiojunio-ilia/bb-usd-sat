@@ -88,6 +88,72 @@ db_client = SatDBClient(json_)
 
 # COMMAND ----------
 
+# Egress connectivity check: probe the external endpoints this scan depends on
+# and append the results to {analysis_schema}.network_diagnostics. Failures
+# here never block the scan; the goal is a persistent record that lets us
+# compare network behavior across workspaces and over time.
+
+NETWORK_DIAG_ENDPOINTS = [
+    "https://github.com",
+    "https://raw.githubusercontent.com",
+    "https://objects.githubusercontent.com",
+]
+
+
+def record_network_diagnostics(source: str) -> None:
+    try:
+        create_network_diagnostics_table()
+        schema = json_["analysis_schema_name"]
+        ws_id = str(json_.get("workspace_id", "unknown")).replace("'", "''")
+        ws_url = str(hostname or "").replace("'", "''")
+        for endpoint in NETWORK_DIAG_ENDPOINTS:
+            probe_start = time.time()
+            try:
+                resp = requests.head(endpoint, timeout=10, allow_redirects=True)
+                latency = round((time.time() - probe_start) * 1000.0, 1)
+                code, ok, detail = str(resp.status_code), "true", ""
+            except Exception as exc:
+                latency = round((time.time() - probe_start) * 1000.0, 1)
+                code, ok = "NULL", "false"
+                detail = str(exc)[:500].replace("'", "''")
+            spark.sql(
+                f"""INSERT INTO {schema}.network_diagnostics
+                    (workspace_id, workspace_url, source, endpoint, reachable, http_code, latency_ms, detail, check_time)
+                    VALUES ('{ws_id}', '{ws_url}', '{source}', '{endpoint}',
+                            {ok}, {code}, {latency}, '{detail}', current_timestamp())"""
+            )
+        print(f"Network diagnostics recorded for {len(NETWORK_DIAG_ENDPOINTS)} endpoint(s)")
+    except Exception as exc:
+        print(f"Network diagnostics skipped: {exc}")
+
+
+record_network_diagnostics("cluster_secrets_scan")
+
+# COMMAND ----------
+
+# Offline TruffleHog: when a pre-provisioned binary exists in the workspace
+# lib/ folder, stage it to /tmp before the install cell so no download is
+# needed. The install cell below is idempotent and skips the download when
+# /tmp/trufflehog already exists.
+import os as _os
+import shutil as _shutil
+import stat as _stat
+
+try:
+    _lib_trufflehog = f"{getLibPath()}/trufflehog"
+    if _os.path.exists("/tmp/trufflehog"):
+        print("TruffleHog already present at /tmp/trufflehog")
+    elif _os.path.exists(_lib_trufflehog):
+        _shutil.copyfile(_lib_trufflehog, "/tmp/trufflehog")
+        _os.chmod("/tmp/trufflehog", _os.stat("/tmp/trufflehog").st_mode | _stat.S_IXUSR | _stat.S_IXGRP | _stat.S_IXOTH)
+        print(f"TruffleHog staged from {_lib_trufflehog} to /tmp/trufflehog")
+    else:
+        print(f"No pre-provisioned TruffleHog at {_lib_trufflehog}; the install cell will download it")
+except Exception as exc:
+    print(f"TruffleHog pre-stage skipped: {exc}")
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC ## Step 1: Install Dependencies and Setup TruffleHog
 # MAGIC

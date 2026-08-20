@@ -727,6 +727,52 @@ def create_clusters_secret_scan_results_table():
 # COMMAND ----------
 
 
+def create_network_diagnostics_table():
+    schema = json_["analysis_schema_name"]
+    existed = spark.catalog.tableExists(f"{schema}.network_diagnostics")
+    spark.sql(
+        f"""CREATE TABLE IF NOT EXISTS {schema}.network_diagnostics (
+        workspace_id STRING,
+        workspace_url STRING,
+        source STRING,
+        endpoint STRING,
+        reachable BOOLEAN,
+        http_code INTEGER,
+        latency_ms DOUBLE,
+        detail STRING,
+        check_time TIMESTAMP,
+        chk_date DATE GENERATED ALWAYS AS (CAST(check_time AS DATE))
+    )
+    USING DELTA
+    PARTITIONED BY (chk_date)
+    """
+    )
+    # Comments are applied only on first creation to avoid concurrent
+    # metadata updates when multiple scan tasks start at the same time.
+    if not existed:
+        _set_table_comment(
+            schema, "network_diagnostics",
+            "Egress connectivity checks recorded by SAT jobs at the start of each run. Each row is one probe from the "
+            "workspace where the job ran to an external endpoint the job depends on. Use to compare network behavior "
+            "across workspaces and over time, e.g. why a download works in one workspace and fails in another."
+        )
+        _set_column_comments(schema, "network_diagnostics", {
+            "workspace_id":  "Databricks workspace ID where the job (and this probe) ran",
+            "workspace_url": "API URL of the workspace where the probe ran",
+            "source":        "SAT task that recorded the probe (e.g. notebook_secret_scan, cluster_secrets_scan)",
+            "endpoint":      "External endpoint probed (e.g. https://github.com)",
+            "reachable":     "True if the endpoint answered an HTTP request within the timeout",
+            "http_code":     "HTTP status code returned by the endpoint, NULL when the connection failed",
+            "latency_ms":    "Round-trip time of the probe in milliseconds",
+            "detail":        "Error detail when the probe failed, empty when it succeeded",
+            "check_time":    "Timestamp when the probe ran",
+            "chk_date":      "Date partition derived from check_time",
+        })
+
+
+# COMMAND ----------
+
+
 def create_workspace_run_complete_table():
     schema = json_["analysis_schema_name"]
     df = spark.sql(
