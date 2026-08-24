@@ -146,6 +146,8 @@ targets:
     permissions:
       - level: CAN_MANAGE
         group_name: SLNUSDLG      # grupo USD: ve e gerencia os jobs do canary
+      - level: CAN_MANAGE
+        service_principal_name: ${var.run_as_sp}   # identidade que faz o deploy; explicita para nao depender de quem deploya
     presets:
       name_prefix: "[canary] "      # paralelo ao SAT atual do BB
       trigger_pause_status: PAUSED

@@ -65,11 +65,27 @@ json_ = {
 
 # COMMAND ----------
 
-intermediate_schema_name = (
-    f"{json_['analysis_schema_name'].split('.')[0]}.intermediate_schema"
-    if '.' in json_['analysis_schema_name']
-    else "hive_metastore.intermediate_schema"
-)
+# O schema intermediario era derivado do catalogo apenas, entao dois targets no
+# mesmo catalogo (ex.: producao e canary em usd_prd) compartilhavam o mesmo
+# objeto fisico: um sobrescrevia as tabelas de rascunho do outro e o DROP CASCADE
+# final derrubava as do vizinho. O sufixo do schema de analise torna o rascunho
+# unico por target. O nome legado e preservado para o schema padrao, para nao
+# alterar instalacoes existentes.
+#
+# A regra fica numa funcao porque o nome e calculado duas vezes: aqui, com o
+# valor do secret scope, e novamente depois que os parametros do bundle chegam.
+def derive_intermediate_schema(analysis_schema_name):
+    # O valor pode chegar com crases (vindo do secret scope) ou sem elas (vindo
+    # do parametro do bundle). O sufixo e montado a partir do nome limpo, senao
+    # uma crase no meio geraria um identificador invalido.
+    short = analysis_schema_name.split('.')[-1].strip().strip('`')
+    suffix = "" if short == "analysis_schema" else f"_{short}"
+    if '.' in analysis_schema_name:
+        return f"{analysis_schema_name.split('.')[0]}.intermediate_schema{suffix}"
+    return f"hive_metastore.intermediate_schema{suffix}"
+
+
+intermediate_schema_name = derive_intermediate_schema(json_['analysis_schema_name'])
 json_.update(
     {
         "intermediate_schema" : intermediate_schema_name
@@ -197,11 +213,10 @@ for _k in ("maxpages", "timebetweencalls", "secrets_max_parallel_workspaces"):
 if isinstance(json_.get("use_parallel_runs"), str):
     json_["use_parallel_runs"] = json_["use_parallel_runs"].strip().lower() == "true"
 
-# re-deriva o intermediate_schema caso o catalogo/schema tenha mudado
-json_["intermediate_schema"] = (
-    f"{json_['analysis_schema_name'].split('.')[0]}.intermediate_schema"
-    if "." in json_["analysis_schema_name"] else "hive_metastore.intermediate_schema"
-)
+# re-deriva o intermediate_schema caso o catalogo/schema tenha mudado.
+# Usa a mesma funcao da primeira derivacao: duas formulas separadas ja fizeram
+# esta linha desfazer silenciosamente o valor calculado acima.
+json_["intermediate_schema"] = derive_intermediate_schema(json_["analysis_schema_name"])
 
 # Fail-closed: em execucao de job do bundle o schema DEVE vir por parametro.
 # Sem widget, o valor acima veio do secret scope — que pode apontar para o

@@ -90,8 +90,9 @@ db_client = SatDBClient(json_)
 
 # Egress connectivity check: probe the external endpoints this scan depends on
 # and append the results to {analysis_schema}.network_diagnostics. Failures
-# here never block the scan; the goal is a persistent record that lets us
-# compare network behavior across workspaces and over time.
+# here never block the scan; the goal is a persistent record of whether the
+# endpoints SAT needs are reachable from the workspace hosting its cluster,
+# and how that changes over time. Recorded once per run per scan task.
 
 NETWORK_DIAG_ENDPOINTS = [
     "https://github.com",
@@ -104,8 +105,36 @@ def record_network_diagnostics(source: str) -> None:
     try:
         create_network_diagnostics_table()
         schema = json_["analysis_schema_name"]
+
+        # The probe leaves from the workspace hosting the SAT cluster, which is
+        # not the workspace being analyzed. apiUrl() returns the regional Azure
+        # endpoint and identifies nothing, so the cluster's own workspace host
+        # is used instead.
+        try:
+            probe_host = spark.conf.get("spark.databricks.workspaceUrl")
+        except Exception:
+            probe_host = str(hostname or "")
+
+        raw_run_id = json_.get("run_id")
+        try:
+            run_id_sql = str(int(raw_run_id))
+        except (TypeError, ValueError):
+            run_id_sql = "NULL"
+
+        # One probe set per job run per source: the scan notebook is invoked
+        # once per analyzed workspace, and every invocation would otherwise
+        # re-measure the same single egress path.
+        if run_id_sql != "NULL":
+            already = spark.sql(
+                f"""SELECT 1 FROM {schema}.network_diagnostics
+                    WHERE run_id = {run_id_sql} AND source = '{source}' LIMIT 1"""
+            ).take(1)
+            if already:
+                print(f"Network diagnostics already recorded for run {run_id_sql} ({source})")
+                return
+
         ws_id = str(json_.get("workspace_id", "unknown")).replace("'", "''")
-        ws_url = str(hostname or "").replace("'", "''")
+        ws_url = str(probe_host).replace("'", "''")
         for endpoint in NETWORK_DIAG_ENDPOINTS:
             probe_start = time.time()
             try:
@@ -118,14 +147,13 @@ def record_network_diagnostics(source: str) -> None:
                 detail = str(exc)[:500].replace("'", "''")
             spark.sql(
                 f"""INSERT INTO {schema}.network_diagnostics
-                    (workspace_id, workspace_url, source, endpoint, reachable, http_code, latency_ms, detail, check_time)
-                    VALUES ('{ws_id}', '{ws_url}', '{source}', '{endpoint}',
+                    (workspace_id, workspace_url, run_id, source, endpoint, reachable, http_code, latency_ms, detail, check_time)
+                    VALUES ('{ws_id}', '{ws_url}', {run_id_sql}, '{source}', '{endpoint}',
                             {ok}, {code}, {latency}, '{detail}', current_timestamp())"""
             )
-        print(f"Network diagnostics recorded for {len(NETWORK_DIAG_ENDPOINTS)} endpoint(s)")
+        print(f"Network diagnostics recorded for {len(NETWORK_DIAG_ENDPOINTS)} endpoint(s) from {probe_host}")
     except Exception as exc:
         print(f"Network diagnostics skipped: {exc}")
-
 
 record_network_diagnostics("cluster_secrets_scan")
 

@@ -727,6 +727,109 @@ def create_clusters_secret_scan_results_table():
 # COMMAND ----------
 
 
+def create_scan_object_events_table():
+    schema = json_["analysis_schema_name"]
+    existed = spark.catalog.tableExists(f"{schema}.scan_object_events")
+    spark.sql(
+        f"""CREATE TABLE IF NOT EXISTS {schema}.scan_object_events (
+        workspace_id STRING,
+        run_id BIGINT,
+        source STRING,
+        object_path STRING,
+        object_id STRING,
+        outcome STRING,
+        detail STRING,
+        check_time TIMESTAMP,
+        chk_date DATE GENERATED ALWAYS AS (CAST(check_time AS DATE))
+    )
+    USING DELTA
+    PARTITIONED BY (chk_date)
+    """
+    )
+    if not existed:
+        try:
+            _set_table_comment(
+                schema, "scan_object_events",
+                "Uma linha por objeto que a analise de segredos nao conseguiu escanear, com o motivo. Complementa "
+                "scan_discovery_stats, que traz apenas os totais: aqui esta o caminho de cada objeto, o que permite "
+                "acompanhar o mesmo notebook entre execucoes e ver se o problema persiste ou se resolveu sozinho. "
+                "Objetos escaneados com sucesso nao aparecem, e os descartados por regra de filtro entram apenas como "
+                "contagem em scan_discovery_stats."
+            )
+            _set_column_comments(schema, "scan_object_events", {
+                "workspace_id": "Databricks workspace ID onde o objeto estava",
+                "run_id":       "ID da execucao do SAT — chave estrangeira para run_number_table.runID",
+                "source":       "Tarefa que registrou o evento (ex.: notebook_secret_scan)",
+                "object_path":  "Caminho do objeto no workspace, como visto na descoberta",
+                "object_id":    "ID do objeto no Databricks, estavel mesmo quando o caminho muda",
+                "outcome":      "Motivo de nao ter sido escaneado: stale_path (caminho mudou entre descoberta e leitura), access_denied (HTTP 403), export_failed, empty, non_text, unexpected_status, error",
+                "detail":       "Detalhe do motivo, quando houver",
+                "check_time":   "Momento do registro",
+                "chk_date":     "Particao de data derivada de check_time",
+            })
+        except Exception as exc:
+            print(f"scan_object_events comments skipped: {exc}")
+
+
+# COMMAND ----------
+
+
+def create_scan_discovery_stats_table():
+    schema = json_["analysis_schema_name"]
+    existed = spark.catalog.tableExists(f"{schema}.scan_discovery_stats")
+    spark.sql(
+        f"""CREATE TABLE IF NOT EXISTS {schema}.scan_discovery_stats (
+        workspace_id STRING,
+        run_id BIGINT,
+        source STRING,
+        discovered INT,
+        filtered INT,
+        eligible INT,
+        scanned INT,
+        skipped_empty INT,
+        skipped_binary INT,
+        unscanned INT,
+        filter_reason STRING,
+        filter_count INT,
+        check_time TIMESTAMP,
+        chk_date DATE GENERATED ALWAYS AS (CAST(check_time AS DATE))
+    )
+    USING DELTA
+    PARTITIONED BY (chk_date)
+    """
+    )
+    if not existed:
+        try:
+            _set_table_comment(
+                schema, "scan_discovery_stats",
+                "Funil de descoberta do scanner de segredos, por execucao e por workspace. Mostra quantos objetos a "
+                "descoberta retornou, quantos foram descartados antes do scan por nao serem codigo-fonte, quantos "
+                "seguiram para analise e quantos de fato foram lidos. A linha com filter_reason NULL e o resumo do "
+                "workspace; as demais detalham o motivo de cada descarte (extensao ou trecho de caminho)."
+            )
+            _set_column_comments(schema, "scan_discovery_stats", {
+                "workspace_id":   "Databricks workspace ID analisado nesta execucao",
+                "run_id":         "ID da execucao do SAT — chave estrangeira para run_number_table.runID",
+                "source":         "Tarefa que registrou o funil (ex.: notebook_secret_scan)",
+                "discovered":     "Objetos que a descoberta retornou, antes de qualquer filtro",
+                "filtered":       "Objetos descartados antes do scan por nao serem codigo-fonte (dados, binarios, internos de Git)",
+                "eligible":       "Objetos que seguiram para o scan: discovered menos filtered",
+                "scanned":        "Objetos efetivamente lidos e analisados pelo TruffleHog",
+                "skipped_empty":  "Objetos elegiveis que vieram sem conteudo no export",
+                "skipped_binary": "Objetos elegiveis cujo conteudo nao decodificou como texto",
+                "unscanned":      "Elegiveis que nao foram lidos por permissao, throttling ou falha de export. Maior que zero reprova a execucao",
+                "filter_reason":  "Motivo do descarte: extensao (ex.: .parquet) ou trecho de caminho (ex.: /.git/). NULL na linha de resumo",
+                "filter_count":   "Quantidade descartada por esse motivo. NULL na linha de resumo",
+                "check_time":     "Momento do registro",
+                "chk_date":       "Particao de data derivada de check_time",
+            })
+        except Exception as exc:
+            print(f"scan_discovery_stats comments skipped: {exc}")
+
+
+# COMMAND ----------
+
+
 def create_network_diagnostics_table():
     schema = json_["analysis_schema_name"]
     existed = spark.catalog.tableExists(f"{schema}.network_diagnostics")
@@ -734,6 +837,7 @@ def create_network_diagnostics_table():
         f"""CREATE TABLE IF NOT EXISTS {schema}.network_diagnostics (
         workspace_id STRING,
         workspace_url STRING,
+        run_id BIGINT,
         source STRING,
         endpoint STRING,
         reachable BOOLEAN,
@@ -747,27 +851,47 @@ def create_network_diagnostics_table():
     PARTITIONED BY (chk_date)
     """
     )
-    # Comments are applied only on first creation to avoid concurrent
-    # metadata updates when multiple scan tasks start at the same time.
-    if not existed:
-        _set_table_comment(
-            schema, "network_diagnostics",
-            "Egress connectivity checks recorded by SAT jobs at the start of each run. Each row is one probe from the "
-            "workspace where the job ran to an external endpoint the job depends on. Use to compare network behavior "
-            "across workspaces and over time, e.g. why a download works in one workspace and fails in another."
-        )
-        _set_column_comments(schema, "network_diagnostics", {
-            "workspace_id":  "Databricks workspace ID where the job (and this probe) ran",
-            "workspace_url": "API URL of the workspace where the probe ran",
-            "source":        "SAT task that recorded the probe (e.g. notebook_secret_scan, cluster_secrets_scan)",
-            "endpoint":      "External endpoint probed (e.g. https://github.com)",
-            "reachable":     "True if the endpoint answered an HTTP request within the timeout",
-            "http_code":     "HTTP status code returned by the endpoint, NULL when the connection failed",
-            "latency_ms":    "Round-trip time of the probe in milliseconds",
-            "detail":        "Error detail when the probe failed, empty when it succeeded",
-            "check_time":    "Timestamp when the probe ran",
-            "chk_date":      "Date partition derived from check_time",
-        })
+
+    # A table created before run_id existed is brought forward in place; old
+    # rows keep a NULL run_id, which the dedup treats as "unknown run".
+    migrated = False
+    if existed:
+        try:
+            cols = {f.name for f in spark.table(f"{schema}.network_diagnostics").schema.fields}
+            if "run_id" not in cols:
+                spark.sql(f"ALTER TABLE {schema}.network_diagnostics ADD COLUMNS (run_id BIGINT)")
+                migrated = True
+        except Exception as exc:
+            print(f"network_diagnostics migration skipped: {exc}")
+
+    # Two scan tasks can reach this point at the same time. Comments are
+    # cosmetic metadata, so a concurrent COMMENT/ALTER losing the race must
+    # never abort the caller: they are attempted on first creation or right
+    # after a schema migration, and any conflict is swallowed.
+    if not existed or migrated:
+        try:
+            _set_table_comment(
+                schema, "network_diagnostics",
+                "Egress connectivity checks recorded by SAT jobs at the start of each run. Each row is one probe to an "
+                "external endpoint the job depends on, issued from the workspace that hosts the SAT cluster. Use to see "
+                "whether the endpoints SAT needs are reachable and how that changes over time. Note this measures the "
+                "egress of the SAT workspace only, not of each analyzed workspace."
+            )
+            _set_column_comments(schema, "network_diagnostics", {
+                "workspace_id":  "Databricks workspace ID this SAT task was analyzing when the probe ran — the target, not the origin of the request",
+                "workspace_url": "Host of the workspace the probe was issued from, i.e. where the SAT cluster runs",
+                "run_id":        "SAT run ID the probe belongs to — foreign key to run_number_table.runID; NULL for rows written before this column existed",
+                "source":        "SAT task that recorded the probe (e.g. notebook_secret_scan, cluster_secrets_scan)",
+                "endpoint":      "External endpoint probed (e.g. https://github.com)",
+                "reachable":     "True if the endpoint answered an HTTP request within the timeout. A 404 still counts as reachable: the host answered",
+                "http_code":     "HTTP status code returned by the endpoint, NULL when the connection failed",
+                "latency_ms":    "Round-trip time of the probe in milliseconds",
+                "detail":        "Error detail when the probe failed, empty when it succeeded",
+                "check_time":    "Timestamp when the probe ran",
+                "chk_date":      "Date partition derived from check_time",
+            })
+        except Exception as exc:
+            print(f"network_diagnostics comments skipped: {exc}")
 
 
 # COMMAND ----------

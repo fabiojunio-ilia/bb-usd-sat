@@ -94,8 +94,9 @@ db_client = SatDBClient(json_)
 
 # Egress connectivity check: probe the external endpoints this scan depends on
 # and append the results to {analysis_schema}.network_diagnostics. Failures
-# here never block the scan; the goal is a persistent record that lets us
-# compare network behavior across workspaces and over time.
+# here never block the scan; the goal is a persistent record of whether the
+# endpoints SAT needs are reachable from the workspace hosting its cluster,
+# and how that changes over time. Recorded once per run per scan task.
 
 NETWORK_DIAG_ENDPOINTS = [
     "https://github.com",
@@ -108,8 +109,36 @@ def record_network_diagnostics(source: str) -> None:
     try:
         create_network_diagnostics_table()
         schema = json_["analysis_schema_name"]
+
+        # The probe leaves from the workspace hosting the SAT cluster, which is
+        # not the workspace being analyzed. apiUrl() returns the regional Azure
+        # endpoint and identifies nothing, so the cluster's own workspace host
+        # is used instead.
+        try:
+            probe_host = spark.conf.get("spark.databricks.workspaceUrl")
+        except Exception:
+            probe_host = str(hostname or "")
+
+        raw_run_id = json_.get("run_id")
+        try:
+            run_id_sql = str(int(raw_run_id))
+        except (TypeError, ValueError):
+            run_id_sql = "NULL"
+
+        # One probe set per job run per source: the scan notebook is invoked
+        # once per analyzed workspace, and every invocation would otherwise
+        # re-measure the same single egress path.
+        if run_id_sql != "NULL":
+            already = spark.sql(
+                f"""SELECT 1 FROM {schema}.network_diagnostics
+                    WHERE run_id = {run_id_sql} AND source = '{source}' LIMIT 1"""
+            ).take(1)
+            if already:
+                print(f"Network diagnostics already recorded for run {run_id_sql} ({source})")
+                return
+
         ws_id = str(json_.get("workspace_id", "unknown")).replace("'", "''")
-        ws_url = str(hostname or "").replace("'", "''")
+        ws_url = str(probe_host).replace("'", "''")
         for endpoint in NETWORK_DIAG_ENDPOINTS:
             probe_start = time.time()
             try:
@@ -122,14 +151,13 @@ def record_network_diagnostics(source: str) -> None:
                 detail = str(exc)[:500].replace("'", "''")
             spark.sql(
                 f"""INSERT INTO {schema}.network_diagnostics
-                    (workspace_id, workspace_url, source, endpoint, reachable, http_code, latency_ms, detail, check_time)
-                    VALUES ('{ws_id}', '{ws_url}', '{source}', '{endpoint}',
+                    (workspace_id, workspace_url, run_id, source, endpoint, reachable, http_code, latency_ms, detail, check_time)
+                    VALUES ('{ws_id}', '{ws_url}', {run_id_sql}, '{source}', '{endpoint}',
                             {ok}, {code}, {latency}, '{detail}', current_timestamp())"""
             )
-        print(f"Network diagnostics recorded for {len(NETWORK_DIAG_ENDPOINTS)} endpoint(s)")
+        print(f"Network diagnostics recorded for {len(NETWORK_DIAG_ENDPOINTS)} endpoint(s) from {probe_host}")
     except Exception as exc:
         print(f"Network diagnostics skipped: {exc}")
-
 
 record_network_diagnostics("notebook_secret_scan")
 
@@ -250,6 +278,101 @@ from typing import Dict, List, Optional, Any, Tuple
 # Configure logging for better debugging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Objects that were discovered but hold nothing to scan: empty files and
+# binaries such as images. They are not scan failures and must not count
+# toward the incomplete-scan check.
+skip_stats = {"empty": 0, "non_text": 0}
+
+# Objeto que existia na descoberta e cujo caminho nao vale mais na hora da
+# leitura, por ter sido movido ou removido no intervalo. Nao e falha do SAT nem
+# de acesso: o alvo mudou de lugar. Contado a parte para nao reprovar a execucao.
+stale_stats = {"stale_path": 0}
+
+
+# --- Filtro de descoberta -------------------------------------------------
+# A descoberta por workspace/list e por unified-search devolve todo objeto de
+# uma pasta, nao apenas codigo-fonte: arquivos de dado (.parquet), o object
+# store interno do Git (.git/objects) e binarios diversos entram na lista.
+# Nenhum deles tem texto escaneavel, e a API de export recusa boa parte com
+# erro em vez de conteudo vazio — o que os fazia cair no balde de falha e
+# disparar INCOMPLETE SCAN por motivo errado.
+#
+# Filtrar antes de exportar tem dois efeitos: o portao de falha volta a medir
+# so o que importa, e o job para de gastar chamadas de API com arquivos que
+# jamais teriam conteudo util.
+
+NON_SOURCE_PATH_PARTS = (
+    "/.git/",          # object store, refs e packs do Git
+    "/_delta_log/",    # log de transacao do Delta
+    "/__pycache__/",
+    "/.ipynb_checkpoints/",
+)
+
+NON_SOURCE_EXTENSIONS = (
+    # dados
+    ".parquet", ".avro", ".orc", ".crc", ".snappy",
+    # internos do Git
+    ".pack", ".idx", ".rev", ".promisor", ".bitmap",
+    # binarios e empacotados
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".svg", ".webp",
+    ".pdf", ".zip", ".gz", ".tar", ".7z", ".jar", ".war", ".whl", ".egg",
+    ".so", ".dll", ".dylib", ".exe", ".bin", ".class", ".pyc", ".pyd",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf",
+    ".mp3", ".mp4", ".avi", ".mov", ".wav",
+    ".xlsx", ".xls", ".docx", ".doc", ".pptx", ".ppt",
+)
+
+# Contagem do que foi filtrado, por motivo. Zerada a cada execucao do fluxo.
+discovery_stats = {"discovered": 0, "eligible": 0}
+filtered_reasons: Dict[str, int] = {}
+
+# Registro por objeto do que nao foi escaneado, com o motivo. Contagem agregada
+# responde "quanto"; isto responde "qual e por que", que e o que permite
+# comparar execucoes: o notebook X falhou ontem por Y e passou hoje.
+# Cada item: (caminho, object_id, desfecho, detalhe).
+object_events: List[tuple] = []
+
+
+def record_object_event(path: str, object_id: str, outcome: str, detail: str = "") -> None:
+    object_events.append((path or "", str(object_id or ""), outcome, detail or ""))
+
+
+def classify_non_source(path: str) -> Optional[str]:
+    """Devolve o motivo do descarte, ou None quando o objeto e elegivel."""
+    if not path:
+        return None
+    lowered = path.lower()
+    for part in NON_SOURCE_PATH_PARTS:
+        if part in lowered:
+            return part
+    for ext in NON_SOURCE_EXTENSIONS:
+        if lowered.endswith(ext):
+            return ext
+    return None
+
+
+def filter_non_source(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Separa os objetos elegiveis e contabiliza os descartados por motivo.
+
+    `items` chega no formato {id, name, workspace_path}, o mesmo que o
+    processador de lote consome.
+    """
+    eligible = []
+    for item in items:
+        parent = item.get("workspace_path", "") or ""
+        name = item.get("name", "") or ""
+        full_path = f"{parent}/{name}" if parent else name
+        reason = classify_non_source(full_path)
+        if reason is None:
+            eligible.append(item)
+        else:
+            filtered_reasons[reason] = filtered_reasons.get(reason, 0) + 1
+
+    discovery_stats["discovered"] += len(items)
+    discovery_stats["eligible"] += len(eligible)
+    return eligible
+
 
 def _default_config() -> Dict[str, Any]:
     """Built-in fallback used only when the shipped config can't be loaded."""
@@ -675,11 +798,14 @@ def discover_notebooks_via_workspace_list(time_filter_enabled: bool,
                 kept.extend(o for o in pool.map(_keep_if_recent, need_meta) if o is not None)
 
     # Normalize to the {id, name, workspace_path} shape the batch processor expects.
-    return [{
+    normalized = [{
         "id": str(obj.get("object_id", "")),
         "name": obj.get("path", "").rsplit("/", 1)[-1],
         "workspace_path": obj.get("path", "").rsplit("/", 1)[0],
     } for obj in kept]
+
+    # Descarta o que nao e codigo-fonte antes de qualquer chamada de export.
+    return filter_non_source(normalized)
 
 def get_fuse_path(workspace_path: str) -> Optional[str]:
     """Find the actual file on the FUSE mount by trying common extensions."""
@@ -727,6 +853,19 @@ def decode_and_write_content(content: str, output_path: str) -> bool:
     """
     try:
         decoded_content = base64.b64decode(content).decode("utf-8")
+    except UnicodeDecodeError:
+        # Workspace discovery returns every object in a folder, including
+        # images and other binaries committed alongside notebooks. They hold
+        # no scannable text, so they are skipped rather than treated as a
+        # failed read.
+        skip_stats["non_text"] += 1
+        logger.info(f"Skipping non-text object (binary content): {output_path}")
+        return False
+    except Exception as e:
+        logger.error(f"Error decoding content for {output_path}: {str(e)}")
+        return False
+
+    try:
         with open(output_path, "w", encoding="utf-8") as file:
             file.write(decoded_content)
         return True
@@ -980,6 +1119,77 @@ def insert_secret_scan_results_batch(workspace_id: str,
         insert_stats["failed"] += len(rows)
         logger.error(f"Failed to insert {len(rows)} secret scan result(s): {str(e)}")
 
+def record_object_events(workspace_id: str, run_id: Optional[int], source: str) -> None:
+    """Grava em lote os objetos nao escaneados em {analysis_schema}.scan_object_events.
+
+    Sem isso o detalhe vive so no log do job, que expira — e a comparacao entre
+    execucoes fica impossivel.
+    """
+    if not object_events:
+        return
+    try:
+        create_scan_object_events_table()
+        schema = json_["analysis_schema_name"]
+        ws = _sql_str(workspace_id)
+        rid = str(int(run_id)) if run_id is not None else "NULL"
+        src = _sql_str(source)
+
+        # Lotes para nao montar um INSERT gigante num workspace com muitos eventos.
+        tamanho = 500
+        for inicio in range(0, len(object_events), tamanho):
+            fatia = object_events[inicio:inicio + tamanho]
+            valores = ",".join(
+                f"({ws}, {rid}, {src}, {_sql_str(caminho)}, {_sql_str(oid)}, "
+                f"{_sql_str(desfecho)}, {_sql_str(detalhe)}, current_timestamp())"
+                for caminho, oid, desfecho, detalhe in fatia
+            )
+            spark.sql(
+                f"""INSERT INTO {schema}.scan_object_events
+                    (workspace_id, run_id, source, object_path, object_id, outcome, detail, check_time)
+                    VALUES {valores}"""
+            )
+        logger.info(f"Object events recorded: {len(object_events)}")
+    except Exception as exc:
+        logger.error(f"Failed to record object events: {exc}")
+
+
+def record_discovery_stats(workspace_id: str, run_id: Optional[int], source: str,
+                           discovered: int, filtered: int, eligible: int,
+                           scanned: int, skipped: int, unscanned: int) -> None:
+    """Grava o funil de descoberta em {analysis_schema}.scan_discovery_stats.
+
+    Uma linha de resumo por workspace (filter_reason NULL) e uma linha por
+    motivo de descarte, para que o que foi filtrado fique auditavel depois da
+    execucao — e nao apenas no log do job, que expira.
+    """
+    try:
+        create_scan_discovery_stats_table()
+        schema = json_["analysis_schema_name"]
+        ws = _sql_str(workspace_id)
+        rid = str(int(run_id)) if run_id is not None else "NULL"
+        src = _sql_str(source)
+
+        linhas = [
+            f"({ws}, {rid}, {src}, {discovered}, {filtered}, {eligible}, {scanned}, "
+            f"{skip_stats['empty']}, {skip_stats['non_text']}, {unscanned}, NULL, NULL, current_timestamp())"
+        ]
+        for motivo, qtd in sorted(filtered_reasons.items(), key=lambda kv: -kv[1]):
+            linhas.append(
+                f"({ws}, {rid}, {src}, {discovered}, {filtered}, {eligible}, {scanned}, "
+                f"{skip_stats['empty']}, {skip_stats['non_text']}, {unscanned}, {_sql_str(motivo)}, {qtd}, current_timestamp())"
+            )
+
+        spark.sql(
+            f"""INSERT INTO {schema}.scan_discovery_stats
+                (workspace_id, run_id, source, discovered, filtered, eligible, scanned,
+                 skipped_empty, skipped_binary, unscanned, filter_reason, filter_count, check_time)
+                VALUES {",".join(linhas)}"""
+        )
+        logger.info(f"Discovery stats recorded: {discovered} discovered, {filtered} filtered, {eligible} eligible")
+    except Exception as exc:
+        logger.error(f"Failed to record discovery stats: {exc}")
+
+
 def insert_no_secrets_tracking_row(workspace_id: str, run_id: int) -> None:
     """
     Insert a single tracking row for a scan run where no secrets were found.
@@ -1097,27 +1307,35 @@ def scan_notebook_for_secrets(notebook_path: str, object_id: str) -> Optional[Li
             if notebook_status == 200:
                 export_response = export_notebook_content(notebook_path)
                 if export_response is None:
+                    record_object_event(notebook_path, notebook_id, "export_failed", "export retornou vazio")
                     logger.warning(f"Failed to export notebook content: {notebook_path}")
                     return None
 
                 content = export_response.get("content")
                 if not content:
-                    logger.warning(f"No content found in notebook: {notebook_path}")
+                    skip_stats["empty"] += 1
+                    record_object_event(notebook_path, notebook_id, "empty", "")
+                    logger.info(f"Skipping empty object (no content): {notebook_path}")
                     return None
 
                 if not decode_and_write_content(content, output_file_path):
+                    record_object_event(notebook_path, notebook_id, "non_text", "conteudo nao decodificou como texto")
                     logger.error(f"Failed to write notebook content to file: {output_file_path}")
                     return None
 
                 logger.info(f"Notebook content exported via API to: {output_file_path}")
 
             elif notebook_status == 403:
+                record_object_event(notebook_path, notebook_id, "access_denied", "HTTP 403 no get-status")
                 logger.warning(f"Access denied for notebook: {notebook_path}")
                 return None
             elif notebook_status == 404:
-                logger.warning(f"Notebook not found: {notebook_path}")
+                stale_stats["stale_path"] += 1
+                record_object_event(notebook_path, notebook_id, "stale_path", "HTTP 404: caminho mudou entre descoberta e leitura")
+                logger.warning(f"Path no longer valid (moved or removed since discovery): {notebook_path}")
                 return None
             else:
+                record_object_event(notebook_path, notebook_id, "unexpected_status", f"HTTP {notebook_status}")
                 logger.warning(f"Unexpected status {notebook_status} for notebook: {notebook_path}")
                 return None
 
@@ -1183,24 +1401,37 @@ def _materialize_notebook(notebook: Dict[str, Any], scan_dir: str) -> Optional[T
         if notebook_status == 200:
             export_response = export_notebook_content(path)
             if not export_response:
+                record_object_event(temp_path, notebook_id, "export_failed", "export retornou vazio")
                 logger.warning(f"Failed to export notebook content: {temp_path}")
                 return None
             content = export_response.get("content")
             if not content:
-                logger.warning(f"No content found in notebook: {temp_path}")
+                skip_stats["empty"] += 1
+                record_object_event(temp_path, notebook_id, "empty", "")
+                logger.info(f"Skipping empty object (no content): {temp_path}")
                 return None
             if not decode_and_write_content(content, scan_file):
+                record_object_event(temp_path, notebook_id, "non_text", "conteudo nao decodificou como texto")
                 logger.error(f"Failed to write notebook content to file: {scan_file}")
                 return None
             return scan_file, metadata
         elif notebook_status == 403:
+            record_object_event(temp_path, notebook_id, "access_denied", "HTTP 403 no get-status")
             logger.warning(f"Access denied for notebook: {temp_path}")
         elif notebook_status == 404:
-            logger.warning(f"Notebook not found: {temp_path}")
+            # O objeto existia na descoberta e nao esta mais neste caminho:
+            # movido ou removido entre a listagem e a leitura. Confirmado em
+            # 24/08/2026 via system.access.audit, com moveNotebook 4s antes do
+            # export. Nao reprova a execucao; a proxima janela pega o caminho novo.
+            stale_stats["stale_path"] += 1
+            record_object_event(temp_path, notebook_id, "stale_path", "HTTP 404: caminho mudou entre descoberta e leitura")
+            logger.warning(f"Path no longer valid (moved or removed since discovery): {temp_path}")
         else:
+            record_object_event(temp_path, notebook_id, "unexpected_status", f"HTTP {notebook_status}")
             logger.warning(f"Unexpected status {notebook_status} for notebook: {temp_path}")
         return None
     except Exception as e:
+        record_object_event(temp_path, notebook.get("id", ""), "error", str(e)[:400])
         logger.error(f"Error materializing notebook {temp_path}: {str(e)}")
         return None
 
@@ -1312,7 +1543,8 @@ def process_search_response(response: Dict[str, Any], results_list: List[Dict[st
         logger.warning("Empty response received")
         return None
 
-    _process_notebook_batch(response.get("results", []), results_list,
+    eligible = filter_non_source(response.get("results", []))
+    _process_notebook_batch(eligible, results_list,
                             output_filename, run_id, workspace_id)
     return response.get("next_page_token")
 
@@ -1384,6 +1616,11 @@ def main_scanning_workflow():
     notebooks_with_secrets = 0
 
     insert_stats.update({"attempted": 0, "written": 0, "failed": 0})
+    skip_stats.update({"empty": 0, "non_text": 0})
+    discovery_stats.update({"discovered": 0, "eligible": 0})
+    filtered_reasons.clear()
+    stale_stats.update({"stale_path": 0})
+    object_events.clear()
 
     # Setup API request parameters
     url = f"{base_url}/api/2.0/search-midtier/unified-search"
@@ -1465,6 +1702,8 @@ def main_scanning_workflow():
             # slicing by the search count would recount the previous page.
             page_start_time = time.time()
             results_before_page = len(results_list)
+            page_skipped_before = skip_stats["empty"] + skip_stats["non_text"]
+            page_filtered_before = discovery_stats["discovered"] - discovery_stats["eligible"]
             next_page_token = process_search_response(response, results_list, Config.RESULTS_LOG_FILE,
                                                      current_run_id, workspace_id)
             page_end_time = time.time()
@@ -1481,8 +1720,11 @@ def main_scanning_workflow():
             notebooks_with_secrets += page_secrets
             total_secrets_found += page_total_secrets
 
-            if page_discovered > page_notebooks:
-                print(f"   ⚠️  Page {page_number}: {page_discovered - page_notebooks} of "
+            page_skipped = (skip_stats["empty"] + skip_stats["non_text"]) - page_skipped_before
+            page_filtered = (discovery_stats["discovered"] - discovery_stats["eligible"]) - page_filtered_before
+            page_unread = page_discovered - page_notebooks - page_skipped - page_filtered
+            if page_unread > 0:
+                print(f"   ⚠️  Page {page_number}: {page_unread} of "
                       f"{page_discovered} notebook(s) could not be read (permissions or "
                       f"export failure) and were NOT scanned")
 
@@ -1503,8 +1745,26 @@ def main_scanning_workflow():
         # Final summary
         print("🎉 Secret Scanning Completed!")
         print("=" * 60)
-        print(f"📊 Notebooks discovered: {total_notebooks_discovered}")
+        total_skipped = skip_stats["empty"] + skip_stats["non_text"]
+        # discovery_stats e a fonte unica: conta o bruto e o elegivel nas duas
+        # rotas de descoberta, antes de qualquer export.
+        total_discovered = discovery_stats["discovered"]
+        total_eligible = discovery_stats["eligible"]
+        total_filtered = total_discovered - total_eligible
+        print(f"📊 Objects discovered: {total_discovered}")
+        print(f"📊 Filtered out before scan (not source code): {total_filtered}")
+        print(f"📊 Sent to scan: {total_eligible}")
         print(f"📊 Notebooks scanned: {total_notebooks_processed}")
+        total_stale = stale_stats["stale_path"]
+        if total_skipped > 0:
+            print(f"📊 Skipped during scan (nothing to read): {total_skipped} "
+                  f"({skip_stats['empty']} empty, {skip_stats['non_text']} binary)")
+        if total_stale > 0:
+            print(f"📊 Path changed since discovery (moved or removed): {total_stale}")
+        if filtered_reasons:
+            top = sorted(filtered_reasons.items(), key=lambda kv: -kv[1])
+            resumo = ", ".join(f"{motivo}={qtd}" for motivo, qtd in top[:10])
+            print(f"📊 Filter breakdown: {resumo}")
         print(f"🔍 Notebooks with secrets: {notebooks_with_secrets}")
         print(f"🚨 Total secrets detected: {total_secrets_found}")
         print(f"💾 Findings written to table: {insert_stats['written']} of {insert_stats['attempted']}")
@@ -1517,6 +1777,12 @@ def main_scanning_workflow():
 
         print(f"📝 Detailed results logged to: {Config.RESULTS_LOG_FILE}")
 
+        record_discovery_stats(workspace_id, current_run_id, "notebook_secret_scan",
+                               total_discovered, total_filtered, total_eligible,
+                               total_notebooks_processed, total_skipped,
+                               max(0, total_eligible - total_notebooks_processed - total_skipped - total_stale))
+        record_object_events(workspace_id, current_run_id, "notebook_secret_scan")
+
         # --- Insert a row if no secrets were found in any notebooks
         if total_secrets_found == 0:
             print("✅ No secrets found in any notebooks. Inserting a single tracking row for this run.")
@@ -1525,13 +1791,18 @@ def main_scanning_workflow():
 
         # Fail loudly on a partial scan: reported totals must not look clean
         # when notebooks went unscanned or findings failed to persist.
-        unscanned = total_notebooks_discovered - total_notebooks_processed
+        # Empty files and binaries were discovered but carry no scannable
+        # text; they are excluded so a clean run is not reported as partial.
+        # stale_path sai da conta: o objeto foi movido ou removido depois da
+        # descoberta, e a proxima janela o alcanca no caminho novo. 403, falha de
+        # export e throttling continuam reprovando.
+        unscanned = total_eligible - total_notebooks_processed - total_skipped - total_stale
         unwritten = insert_stats["attempted"] - insert_stats["written"]
         if unscanned > 0 or unwritten > 0:
             problems = []
             if unscanned > 0:
                 problems.append(
-                    f"{unscanned} of {total_notebooks_discovered} discovered notebook(s) "
+                    f"{unscanned} of {total_eligible} eligible notebook(s) "
                     f"were not scanned (permissions, throttling, or export failure)"
                 )
             if unwritten > 0:
@@ -1546,7 +1817,11 @@ def main_scanning_workflow():
         # Return summary statistics
         return {
             "total_notebooks": total_notebooks_processed,
-            "notebooks_discovered": total_notebooks_discovered,
+            "notebooks_discovered": total_discovered,
+            "notebooks_eligible": total_eligible,
+            "objects_filtered": total_filtered,
+            "objects_skipped": total_skipped,
+            "objects_stale_path": total_stale,
             "notebooks_with_secrets": notebooks_with_secrets,
             "total_secrets": total_secrets_found,
             "findings_written": insert_stats["written"],
