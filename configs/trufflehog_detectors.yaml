@@ -61,8 +61,20 @@ settings:
     scan_batch_dir: "/tmp/notebook_scan_batch"  # Dir where a chunk of notebooks is
                                                 # materialized for a single TruffleHog pass
 
+  completeness:
+    # Execucao parcial vira registro em scan_discovery_stats.status, nao falha do
+    # job. Reprovar em cima de excecao ja conhecida vira ruido, e alarme ruidoso
+    # e alarme desligado. A leitura fica em v_secret_scan_completude.
+    fail_on_incomplete_scan: false
+    # Perda de evidencia e outra coisa: o segredo foi encontrado e o registro se
+    # perdeu. Nenhuma tratativa cobre isso, entao continua reprovando.
+    fail_on_lost_findings: true
+
   search_settings:
     page_size: 50
-    days_back: 1  # Number of days back to search for modified notebooks
+    days_back: 0  # Janela da descoberta, em dias. 1 = incremental diario (so o que
+                  # mudou desde a meia-noite UTC de ontem). 0 = varredura completa do
+                  # acervo, sem filtro de tempo: volume e duracao sobem em ordens de
+                  # grandeza e o job tem timeout de 8h. Voltar para 1 apos a varredura.
                   # Set to 0 to scan ALL notebooks (no time filter)
                   # Can be overridden by TIME environment variable (epoch milliseconds)

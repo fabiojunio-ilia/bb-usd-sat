@@ -271,6 +271,7 @@ import shutil
 import yaml
 import tempfile
 import concurrent.futures
+import random
 from datetime import timedelta, datetime
 from urllib.parse import quote
 from typing import Dict, List, Optional, Any, Tuple
@@ -334,7 +335,15 @@ filtered_reasons: Dict[str, int] = {}
 object_events: List[tuple] = []
 
 
+# Ultima mensagem de erro devolvida pela API por caminho. Preenchida em
+# check_notebook_status e consumida no registro do evento, para que `detail`
+# carregue a explicacao do servidor e nao uma frase nossa.
+_last_api_error: Dict[str, str] = {}
+
+
 def record_object_event(path: str, object_id: str, outcome: str, detail: str = "") -> None:
+    if not detail:
+        detail = _last_api_error.pop(path, "") or ""
     object_events.append((path or "", str(object_id or ""), outcome, detail or ""))
 
 
@@ -385,7 +394,8 @@ def _default_config() -> Dict[str, Any]:
         "settings": {
             "excluded_detectors": ["DatabricksToken"],
             "rate_limiting": {"api_sleep_seconds": 10},
-            "search_settings": {"page_size": 50, "days_back": 1}
+            "search_settings": {"page_size": 50, "days_back": 1},
+            "completeness": {"fail_on_incomplete_scan": False, "fail_on_lost_findings": True}
         }
     }
 
@@ -495,6 +505,12 @@ class Config:
     API_SLEEP_SECONDS = config_data.get("settings", {}).get("rate_limiting", {}).get("api_sleep_seconds", 10)
     PAGE_SIZE = config_data.get("settings", {}).get("search_settings", {}).get("page_size", 50)
     DAYS_BACK = config_data.get("settings", {}).get("search_settings", {}).get("days_back", 1)
+    # Execucao parcial vira registro, nao falha. Perda de evidencia continua
+    # reprovando: ali o segredo foi lido e o INSERT se perdeu, o que nenhuma
+    # tratativa cobre. Ligar fail_on_incomplete_scan devolve o comportamento
+    # antigo sem mexer no codigo.
+    FAIL_ON_INCOMPLETE = bool(config_data.get("settings", {}).get("completeness", {}).get("fail_on_incomplete_scan", False))
+    FAIL_ON_LOST_FINDINGS = bool(config_data.get("settings", {}).get("completeness", {}).get("fail_on_lost_findings", True))
     
     # TruffleHog settings from config
     EXCLUDED_DETECTORS = config_data.get("settings", {}).get("excluded_detectors", ["DatabricksToken"])
@@ -699,10 +715,22 @@ def check_notebook_status(notebook_path: str) -> int:
     Returns:
         int: HTTP status code (200=accessible, 403=no permission, 404=not found)
     """
-    check_url = f"{base_url}/api/2.0/workspace/get-status?path={notebook_path}"
+    check_url = f"{base_url}/api/2.0/workspace/get-status?path={quote(notebook_path)}"
     response = _get_with_retry(check_url, f"get-status for {notebook_path}")
     if response is None:
         return 500  # treated as an unexpected status by callers
+
+    # A mensagem que a API devolve junto de um status de erro e a unica fonte que
+    # explica o motivo. Guardada aqui para o registro por objeto poder cita-la em
+    # vez de repetir uma frase nossa — foi essa falta que tornou um 403 opaco.
+    if response.status_code != 200:
+        try:
+            corpo = response.json()
+            motivo = f"{corpo.get('error_code', '')} {corpo.get('message', '')}".strip()
+        except Exception:
+            motivo = (response.text or "")[:300]
+        _last_api_error[notebook_path] = motivo or f"HTTP {response.status_code} sem corpo"
+
     return response.status_code
 
 
@@ -829,7 +857,7 @@ def export_notebook_content(notebook_path: str) -> Optional[Dict[str, Any]]:
     Returns:
         Optional[Dict[str, Any]]: Notebook export response or None if error
     """
-    url = f"{base_url}/api/2.0/workspace/export?path={notebook_path}"
+    url = f"{base_url}/api/2.0/workspace/export?path={quote(notebook_path)}"
     response = _get_with_retry(url, f"export of {notebook_path}")
     if response is None:
         return None
@@ -1103,21 +1131,44 @@ def insert_secret_scan_results_batch(workspace_id: str,
         return
 
     insert_stats["attempted"] += len(rows)
-    try:
-        ensure_results_table()
-        spark.sql(
-            f"""
-            INSERT INTO {json_["analysis_schema_name"]}.notebooks_secret_scan_results
-            (workspace_id, notebook_id, notebook_path, notebook_name, detector_name,
-             secret_sha256, source_file, verified, secrets_found, run_id, scan_time)
-            VALUES {", ".join(rows)}
-            """
-        )
-        insert_stats["written"] += len(rows)
-        logger.info(f"Persisted {len(rows)} secret finding(s)")
-    except Exception as e:
-        insert_stats["failed"] += len(rows)
-        logger.error(f"Failed to insert {len(rows)} secret scan result(s): {str(e)}")
+
+    # A tabela recebe gravacoes dos workspaces que rodam em paralelo. Um conflito
+    # de metadados ou de escrita concorrente e transitorio: perder o achado por
+    # isso seria pior do que tentar de novo. Ate 4 tentativas, com espera
+    # crescente e jitter para os concorrentes nao voltarem juntos.
+    ultima_falha = None
+    for tentativa in range(4):
+        try:
+            ensure_results_table()
+            spark.sql(
+                f"""
+                INSERT INTO {json_["analysis_schema_name"]}.notebooks_secret_scan_results
+                (workspace_id, notebook_id, notebook_path, notebook_name, detector_name,
+                 secret_sha256, source_file, verified, secrets_found, run_id, scan_time)
+                VALUES {", ".join(rows)}
+                """
+            )
+            insert_stats["written"] += len(rows)
+            logger.info(f"Persisted {len(rows)} secret finding(s)")
+            return
+        except Exception as e:
+            ultima_falha = e
+            transitorio = any(marca in str(e) for marca in (
+                "DELTA_METADATA_CHANGED", "MetadataChangedException",
+                "ConcurrentAppendException", "DELTA_CONCURRENT_APPEND",
+                "ConcurrentWriteException",
+            ))
+            if not transitorio or tentativa == 3:
+                break
+            espera = (2 ** tentativa) + random.uniform(0, 1)
+            logger.warning(
+                f"Conflito concorrente ao gravar {len(rows)} achado(s); "
+                f"nova tentativa em {espera:.1f}s ({tentativa + 1}/3)"
+            )
+            time.sleep(espera)
+
+    insert_stats["failed"] += len(rows)
+    logger.error(f"Failed to insert {len(rows)} secret scan result(s): {str(ultima_falha)}")
 
 def record_object_events(workspace_id: str, run_id: Optional[int], source: str) -> None:
     """Grava em lote os objetos nao escaneados em {analysis_schema}.scan_object_events.
@@ -1153,9 +1204,43 @@ def record_object_events(workspace_id: str, run_id: Optional[int], source: str) 
         logger.error(f"Failed to record object events: {exc}")
 
 
+def record_scan_started(workspace_id: str, run_id: Optional[int], source: str) -> None:
+    """Abre a execucao em {analysis_schema}.scan_discovery_stats com status EM EXECUCAO.
+
+    O registro final so acontece no fim da varredura. Se o notebook morrer antes
+    — timeout, cluster derrubado, OOM — nenhuma linha era gravada e o workspace
+    sumia do relatorio: ausencia de linha nao e um sinal que alguem consegue ver.
+    Esta linha de abertura transforma essa ausencia em presenca. A linha final e
+    um novo append; as views leem a mais recente por (workspace, run, source),
+    entao o que ficar EM EXECUCAO depois do job terminar e execucao interrompida.
+
+    Append, nao UPDATE: varias tarefas escrevem na mesma particao de data ao
+    mesmo tempo, e UPDATE concorrente em Delta ja nos custou conflito antes.
+    """
+    try:
+        create_scan_discovery_stats_table()
+        schema = json_["analysis_schema_name"]
+        rid = str(int(run_id)) if run_id is not None else "NULL"
+        spark.sql(
+            f"""INSERT INTO {schema}.scan_discovery_stats
+                (workspace_id, run_id, source, discovered, filtered, eligible, scanned,
+                 skipped_empty, skipped_binary, unscanned, findings_attempted,
+                 findings_unwritten, status, filter_reason, filter_count, check_time)
+                VALUES ({_sql_str(workspace_id)}, {rid}, {_sql_str(source)},
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 'EM EXECUCAO', NULL, NULL, current_timestamp())"""
+        )
+        logger.info(f"Scan opened for workspace {workspace_id}, run_id {run_id}")
+    except Exception as exc:
+        # Nao derruba a varredura: a linha de abertura e instrumentacao, nao o
+        # trabalho. Perder o marcador e pior que nao ter scan? Nao.
+        logger.error(f"Failed to record scan start: {exc}")
+
+
 def record_discovery_stats(workspace_id: str, run_id: Optional[int], source: str,
                            discovered: int, filtered: int, eligible: int,
-                           scanned: int, skipped: int, unscanned: int) -> None:
+                           scanned: int, skipped: int, unscanned: int,
+                           attempted: int = 0, unwritten: int = 0,
+                           status: str = "COMPLETO") -> None:
     """Grava o funil de descoberta em {analysis_schema}.scan_discovery_stats.
 
     Uma linha de resumo por workspace (filter_reason NULL) e uma linha por
@@ -1169,23 +1254,27 @@ def record_discovery_stats(workspace_id: str, run_id: Optional[int], source: str
         rid = str(int(run_id)) if run_id is not None else "NULL"
         src = _sql_str(source)
 
-        linhas = [
-            f"({ws}, {rid}, {src}, {discovered}, {filtered}, {eligible}, {scanned}, "
-            f"{skip_stats['empty']}, {skip_stats['non_text']}, {unscanned}, NULL, NULL, current_timestamp())"
-        ]
+        st = _sql_str(status)
+        comum = (f"({ws}, {rid}, {src}, {discovered}, {filtered}, {eligible}, {scanned}, "
+                 f"{skip_stats['empty']}, {skip_stats['non_text']}, {unscanned}, "
+                 f"{attempted}, {unwritten}, {st}, ")
+
+        linhas = [comum + "NULL, NULL, current_timestamp())"]
         for motivo, qtd in sorted(filtered_reasons.items(), key=lambda kv: -kv[1]):
-            linhas.append(
-                f"({ws}, {rid}, {src}, {discovered}, {filtered}, {eligible}, {scanned}, "
-                f"{skip_stats['empty']}, {skip_stats['non_text']}, {unscanned}, {_sql_str(motivo)}, {qtd}, current_timestamp())"
-            )
+            linhas.append(comum + f"{_sql_str(motivo)}, {qtd}, current_timestamp())")
 
         spark.sql(
             f"""INSERT INTO {schema}.scan_discovery_stats
                 (workspace_id, run_id, source, discovered, filtered, eligible, scanned,
-                 skipped_empty, skipped_binary, unscanned, filter_reason, filter_count, check_time)
+                 skipped_empty, skipped_binary, unscanned, findings_attempted,
+                 findings_unwritten, status, filter_reason, filter_count, check_time)
                 VALUES {",".join(linhas)}"""
         )
         logger.info(f"Discovery stats recorded: {discovered} discovered, {filtered} filtered, {eligible} eligible")
+        # Views de relatorio: recriadas junto com os dados, para nao dependerem de
+        # uma execucao do initializer. Aqui, e nao no registro de excecoes, porque
+        # aquele retorna cedo quando a execucao foi limpa.
+        create_scan_reporting_views()
     except Exception as exc:
         logger.error(f"Failed to record discovery stats: {exc}")
 
@@ -1326,7 +1415,7 @@ def scan_notebook_for_secrets(notebook_path: str, object_id: str) -> Optional[Li
                 logger.info(f"Notebook content exported via API to: {output_file_path}")
 
             elif notebook_status == 403:
-                record_object_event(notebook_path, notebook_id, "access_denied", "HTTP 403 no get-status")
+                record_object_event(notebook_path, notebook_id, "access_denied")
                 logger.warning(f"Access denied for notebook: {notebook_path}")
                 return None
             elif notebook_status == 404:
@@ -1335,7 +1424,7 @@ def scan_notebook_for_secrets(notebook_path: str, object_id: str) -> Optional[Li
                 logger.warning(f"Path no longer valid (moved or removed since discovery): {notebook_path}")
                 return None
             else:
-                record_object_event(notebook_path, notebook_id, "unexpected_status", f"HTTP {notebook_status}")
+                record_object_event(notebook_path, notebook_id, "unexpected_status", _last_api_error.pop(notebook_path, "") or f"HTTP {notebook_status}")
                 logger.warning(f"Unexpected status {notebook_status} for notebook: {notebook_path}")
                 return None
 
@@ -1416,7 +1505,7 @@ def _materialize_notebook(notebook: Dict[str, Any], scan_dir: str) -> Optional[T
                 return None
             return scan_file, metadata
         elif notebook_status == 403:
-            record_object_event(temp_path, notebook_id, "access_denied", "HTTP 403 no get-status")
+            record_object_event(temp_path, notebook_id, "access_denied")
             logger.warning(f"Access denied for notebook: {temp_path}")
         elif notebook_status == 404:
             # O objeto existia na descoberta e nao esta mais neste caminho:
@@ -1427,7 +1516,7 @@ def _materialize_notebook(notebook: Dict[str, Any], scan_dir: str) -> Optional[T
             record_object_event(temp_path, notebook_id, "stale_path", "HTTP 404: caminho mudou entre descoberta e leitura")
             logger.warning(f"Path no longer valid (moved or removed since discovery): {temp_path}")
         else:
-            record_object_event(temp_path, notebook_id, "unexpected_status", f"HTTP {notebook_status}")
+            record_object_event(temp_path, notebook_id, "unexpected_status", _last_api_error.pop(temp_path, "") or f"HTTP {notebook_status}")
             logger.warning(f"Unexpected status {notebook_status} for notebook: {temp_path}")
         return None
     except Exception as e:
@@ -1582,6 +1671,7 @@ def main_scanning_workflow():
         logger.info(f"Generated new run_id for standalone execution: {current_run_id}")
 
     logger.info(f"TruffleHog scan starting for workspace: {workspace_id}, run_id: {current_run_id}")
+    record_scan_started(workspace_id, current_run_id, "notebook_secret_scan")
     
     # Get time range for notebook search
     # Use environment variable TIME if provided, otherwise use config setting
@@ -1777,10 +1867,22 @@ def main_scanning_workflow():
 
         print(f"📝 Detailed results logged to: {Config.RESULTS_LOG_FILE}")
 
+        # A execucao parcial e um fato a registrar, nao um motivo para derrubar o
+        # job. Reprovar em cima de excecao ja conhecida transforma o alarme em
+        # ruido, e alarme ruidoso e alarme desligado. O veredito vai para
+        # scan_discovery_stats.status e a leitura fica em v_secret_scan_completude,
+        # onde a excecao ja tratada sai da conta do que exige acao.
+        # Empty e binario nao entram: foram descobertos, mas nao tem texto para
+        # ler. stale_path tambem sai — o objeto mudou de lugar entre a descoberta
+        # e a leitura, e a proxima janela o alcanca no caminho novo.
+        unscanned = max(0, total_eligible - total_notebooks_processed - total_skipped - total_stale)
+        unwritten = max(0, insert_stats["attempted"] - insert_stats["written"])
+        status = "INCOMPLETO" if (unscanned > 0 or unwritten > 0) else "COMPLETO"
+
         record_discovery_stats(workspace_id, current_run_id, "notebook_secret_scan",
                                total_discovered, total_filtered, total_eligible,
-                               total_notebooks_processed, total_skipped,
-                               max(0, total_eligible - total_notebooks_processed - total_skipped - total_stale))
+                               total_notebooks_processed, total_skipped, unscanned,
+                               insert_stats["attempted"], unwritten, status)
         record_object_events(workspace_id, current_run_id, "notebook_secret_scan")
 
         # --- Insert a row if no secrets were found in any notebooks
@@ -1789,16 +1891,7 @@ def main_scanning_workflow():
             logger.info("No secrets found in any notebooks. Inserting a single row to track this run.")
             insert_no_secrets_tracking_row(workspace_id, current_run_id)
 
-        # Fail loudly on a partial scan: reported totals must not look clean
-        # when notebooks went unscanned or findings failed to persist.
-        # Empty files and binaries were discovered but carry no scannable
-        # text; they are excluded so a clean run is not reported as partial.
-        # stale_path sai da conta: o objeto foi movido ou removido depois da
-        # descoberta, e a proxima janela o alcanca no caminho novo. 403, falha de
-        # export e throttling continuam reprovando.
-        unscanned = total_eligible - total_notebooks_processed - total_skipped - total_stale
-        unwritten = insert_stats["attempted"] - insert_stats["written"]
-        if unscanned > 0 or unwritten > 0:
+        if status == "INCOMPLETO":
             problems = []
             if unscanned > 0:
                 problems.append(
@@ -1810,9 +1903,18 @@ def main_scanning_workflow():
                     f"{unwritten} of {insert_stats['attempted']} finding(s) failed to persist"
                 )
             message = "INCOMPLETE SCAN for workspace " + f"{workspace_id}: " + "; ".join(problems)
-            print(f"❌ {message}")
-            logger.error(message)
-            raise RuntimeError(message)
+            print(f"⚠️  {message}")
+            print("   Registrado em scan_discovery_stats.status. "
+                  "Consulte v_secret_scan_completude para separar o que ja tem tratativa "
+                  "do que continua PENDENTE.")
+            logger.warning(message)
+            # Perda de evidencia nao e excecao operacional: o segredo foi
+            # encontrado e o registro se perdeu. Nenhuma tratativa cobre isso, e
+            # por isso continua reprovando o job.
+            if Config.FAIL_ON_INCOMPLETE or (unwritten > 0 and Config.FAIL_ON_LOST_FINDINGS):
+                raise RuntimeError(message)
+        else:
+            print(f"✅ Scan completo: {total_notebooks_processed} de {total_eligible} elegiveis.")
 
         # Return summary statistics
         return {

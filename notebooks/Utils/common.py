@@ -472,6 +472,7 @@ def basePath():
 
 def create_schema():
     schema = json_["analysis_schema_name"]
+    run_table_existed = spark.catalog.tableExists(f"{schema}.run_number_table")
     df = spark.sql(f'CREATE DATABASE IF NOT EXISTS {schema}')
     df = spark.sql(f'CREATE DATABASE IF NOT EXISTS {json_["intermediate_schema"]}')
     spark.sql(
@@ -487,16 +488,23 @@ def create_schema():
                         )
                         USING DELTA"""
     )
-    _set_table_comment(
-        schema, "run_number_table",
-        "Sequence table that issues a unique run_id for each SAT analysis execution. "
-        "Join all other tables to this on run_id to correlate findings from the same run. "
-        "Typically has one row per SAT job execution."
-    )
-    _set_column_comments(schema, "run_number_table", {
-        "runID":      "Auto-incrementing unique identifier for each SAT analysis run",
-        "check_time": "Timestamp when this SAT run was initiated",
-    })
+    # A run_number_table recebe um INSERT por workspace, em paralelo. Reaplicar
+    # COMMENT/ALTER a cada execucao colide com esses INSERTs e derruba a alocacao
+    # do run_id com MetadataChangedException.
+    if not run_table_existed:
+        try:
+            _set_table_comment(
+                schema, "run_number_table",
+                "Sequence table that issues a unique run_id for each SAT analysis execution. "
+                "Join all other tables to this on run_id to correlate findings from the same run. "
+                "Typically has one row per SAT job execution."
+            )
+            _set_column_comments(schema, "run_number_table", {
+                "runID":      "Auto-incrementing unique identifier for each SAT analysis run",
+                "check_time": "Timestamp when this SAT run was initiated",
+            })
+        except Exception as exc:
+            print(f"run_number_table comments skipped: {exc}")
 
 
 # COMMAND ----------
@@ -531,6 +539,7 @@ def notifyworkspaceCompleted(workspaceID, completed):
 
 def create_security_checks_table():
     schema = json_["analysis_schema_name"]
+    existed = spark.catalog.tableExists(f"{schema}.security_checks")
     df = spark.sql(
         f"""CREATE TABLE IF NOT EXISTS {schema}.security_checks (
                 workspaceid string,
@@ -545,29 +554,37 @@ def create_security_checks_table():
                 USING DELTA
                 PARTITIONED BY (chk_date)"""
     )
-    _set_table_comment(
-        schema, "security_checks",
-        "Core SAT results table. One row per security check per workspace per run. "
-        "Score=0 means the check passed; Score=1 means violations found. "
-        "Join to security_best_practices on id for check details, and to run_number_table on run_id for run context."
-    )
-    _set_column_comments(schema, "security_checks", {
-        "workspaceid":        "Databricks workspace ID that was analyzed",
-        "id":                 "Security check ID — foreign key to security_best_practices.id",
-        "score":              "0 = check passed; 1 = violation found",
-        "additional_details": "Map of violation context keyed by detail type (e.g. message, workspaceId, resource names). Value is a descriptive string.",
-        "run_id":             "SAT run ID — foreign key to run_number_table.runID",
-        "check_time":         "Timestamp when this check was evaluated",
-        "chk_date":           "Date partition derived from check_time for efficient time-range queries",
-        "chk_hhmm":           "Hour and minute as integer (HHMM format) derived from check_time",
-    })
-
+    # Comentarios sao metadados cosmeticos. Reaplicados a cada execucao, colidem
+    # com os INSERTs dos workspaces que rodam em paralelo e derrubam a gravacao
+    # com MetadataChangedException. Aplicados uma vez, na criacao, e qualquer
+    # conflito e engolido.
+    if not existed:
+        try:
+            _set_table_comment(
+                schema, "security_checks",
+                "Core SAT results table. One row per security check per workspace per run. "
+                "Score=0 means the check passed; Score=1 means violations found. "
+                "Join to security_best_practices on id for check details, and to run_number_table on run_id for run context."
+            )
+            _set_column_comments(schema, "security_checks", {
+                "workspaceid":        "Databricks workspace ID that was analyzed",
+                "id":                 "Security check ID — foreign key to security_best_practices.id",
+                "score":              "0 = check passed; 1 = violation found",
+                "additional_details": "Map of violation context keyed by detail type (e.g. message, workspaceId, resource names). Value is a descriptive string.",
+                "run_id":             "SAT run ID — foreign key to run_number_table.runID",
+                "check_time":         "Timestamp when this check was evaluated",
+                "chk_date":           "Date partition derived from check_time for efficient time-range queries",
+                "chk_hhmm":           "Hour and minute as integer (HHMM format) derived from check_time",
+            })
+        except Exception as exc:
+            print(f"security_checks comments skipped: {exc}")
 
 # COMMAND ----------
 
 
 def create_account_info_table():
     schema = json_["analysis_schema_name"]
+    existed = spark.catalog.tableExists(f"{schema}.account_info")
     df = spark.sql(
         f"""CREATE TABLE IF NOT EXISTS {schema}.account_info (
         workspaceid string,
@@ -582,29 +599,37 @@ def create_account_info_table():
         USING DELTA
         PARTITIONED BY (chk_date)"""
     )
-    _set_table_comment(
-        schema, "account_info",
-        "Workspace-level statistics and properties collected during each SAT run. Each row is one named metric for a workspace. "
-        "The name column uses coded keys: AS-1=account ID, AS-2=cloud region, AS-3=deployment name, AS-4=pricing tier, "
-        "AS-5=workspace ID, AS-6=workspace status, WST-1=total job count, WST-2=orphaned external job count."
-    )
-    _set_column_comments(schema, "account_info", {
-        "workspaceid": "Databricks workspace ID this metric belongs to",
-        "name":        "Coded metric key (e.g. AS-1=account ID, AS-2=cloud region, AS-4=pricing tier, WST-1=job count)",
-        "value":       'JSON-encoded metric value, always in format: {"value": "<metric_value>"}',
-        "category":    "Metric category: Account Stats for account-level properties, Workspace Stats for workspace-level counts",
-        "run_id":      "SAT run ID when this metric was collected — foreign key to run_number_table.runID",
-        "check_time":  "Timestamp when this metric was collected",
-        "chk_date":    "Date partition derived from check_time",
-        "chk_hhmm":    "Hour and minute as integer (HHMM) derived from check_time",
-    })
-
+    # Comentarios sao metadados cosmeticos. Reaplicados a cada execucao, colidem
+    # com os INSERTs dos workspaces que rodam em paralelo e derrubam a gravacao
+    # com MetadataChangedException. Aplicados uma vez, na criacao, e qualquer
+    # conflito e engolido.
+    if not existed:
+        try:
+            _set_table_comment(
+                schema, "account_info",
+                "Workspace-level statistics and properties collected during each SAT run. Each row is one named metric for a workspace. "
+                "The name column uses coded keys: AS-1=account ID, AS-2=cloud region, AS-3=deployment name, AS-4=pricing tier, "
+                "AS-5=workspace ID, AS-6=workspace status, WST-1=total job count, WST-2=orphaned external job count."
+            )
+            _set_column_comments(schema, "account_info", {
+                "workspaceid": "Databricks workspace ID this metric belongs to",
+                "name":        "Coded metric key (e.g. AS-1=account ID, AS-2=cloud region, AS-4=pricing tier, WST-1=job count)",
+                "value":       'JSON-encoded metric value, always in format: {"value": "<metric_value>"}',
+                "category":    "Metric category: Account Stats for account-level properties, Workspace Stats for workspace-level counts",
+                "run_id":      "SAT run ID when this metric was collected — foreign key to run_number_table.runID",
+                "check_time":  "Timestamp when this metric was collected",
+                "chk_date":    "Date partition derived from check_time",
+                "chk_hhmm":    "Hour and minute as integer (HHMM) derived from check_time",
+            })
+        except Exception as exc:
+            print(f"account_info comments skipped: {exc}")
 
 # COMMAND ----------
 
 
 def create_account_workspaces_table():
     schema = json_["analysis_schema_name"]
+    existed = spark.catalog.tableExists(f"{schema}.account_workspaces")
     df = spark.sql(
         f"""CREATE TABLE IF NOT EXISTS {schema}.account_workspaces (
             workspace_id string,
@@ -615,25 +640,33 @@ def create_account_workspaces_table():
             )
             USING DELTA"""
     )
-    _set_table_comment(
-        schema, "account_workspaces",
-        "Registry of Databricks workspaces configured for SAT analysis, with high-level security posture flags set during "
-        "workspace enablement. Used by Genie to answer questions like: which workspaces have SSO enabled?"
-    )
-    _set_column_comments(schema, "account_workspaces", {
-        "workspace_id":                 "Databricks workspace ID",
-        "deployment_url":               "Workspace hostname (e.g. myworkspace.cloud.databricks.com)",
-        "workspace_name":               "Human-readable workspace name",
-        "workspace_status":             "Current Databricks workspace status (e.g. RUNNING)",
-        "analysis_enabled":             "True if SAT is configured to analyze this workspace",
-    })
-
+    # Comentarios sao metadados cosmeticos. Reaplicados a cada execucao, colidem
+    # com os INSERTs dos workspaces que rodam em paralelo e derrubam a gravacao
+    # com MetadataChangedException. Aplicados uma vez, na criacao, e qualquer
+    # conflito e engolido.
+    if not existed:
+        try:
+            _set_table_comment(
+                schema, "account_workspaces",
+                "Registry of Databricks workspaces configured for SAT analysis, with high-level security posture flags set during "
+                "workspace enablement. Used by Genie to answer questions like: which workspaces have SSO enabled?"
+            )
+            _set_column_comments(schema, "account_workspaces", {
+                "workspace_id":                 "Databricks workspace ID",
+                "deployment_url":               "Workspace hostname (e.g. myworkspace.cloud.databricks.com)",
+                "workspace_name":               "Human-readable workspace name",
+                "workspace_status":             "Current Databricks workspace status (e.g. RUNNING)",
+                "analysis_enabled":             "True if SAT is configured to analyze this workspace",
+            })
+        except Exception as exc:
+            print(f"account_workspaces comments skipped: {exc}")
 
 # COMMAND ----------
 
 
 def create_notebooks_secret_scan_results_table():
     schema = json_["analysis_schema_name"]
+    existed = spark.catalog.tableExists(f"{schema}.notebooks_secret_scan_results")
     df = spark.sql(
         f"""CREATE TABLE IF NOT EXISTS {schema}.notebooks_secret_scan_results (
         workspace_id STRING,
@@ -654,31 +687,39 @@ def create_notebooks_secret_scan_results_table():
     PARTITIONED BY (scan_date)
     """
     )
-    _set_table_comment(
-        schema, "notebooks_secret_scan_results",
-        "TruffleHog secret scan results for Databricks notebooks. Identifies potential hardcoded secrets, API keys, "
-        "and credentials in notebook source code. When secrets_found=0 and other fields are NULL, it means the "
-        "workspace was scanned and no secrets were detected."
-    )
-    _set_column_comments(schema, "notebooks_secret_scan_results", {
-        "workspace_id":  "Databricks workspace ID where the notebook resides",
-        "notebook_id":   "Databricks notebook ID that was scanned",
-        "notebook_path": "Full workspace path to the scanned notebook",
-        "notebook_name": "Display name of the scanned notebook",
-        "detector_name": "TruffleHog detector that matched (e.g. AWS, Slack, GitHub, GitLab)",
-        "secret_sha256": "SHA-256 hash of the detected secret value — the actual secret is never stored",
-        "source_file":   "Source file within the notebook where the secret was detected",
-        "verified":      "True if TruffleHog confirmed the secret is currently active and valid",
-        "secrets_found": "Count of secrets detected. 0 with NULL other fields means the workspace was clean.",
-        "run_id":        "SAT secret scan run ID",
-        "scan_time":     "Timestamp when the scan was performed",
-        "scan_date":     "Date partition derived from scan_time",
-        "scan_hhmm":     "Hour and minute as integer (HHMM) derived from scan_time",
-    })
-
+    # Comentarios sao metadados cosmeticos. Reaplicados a cada execucao, colidem
+    # com os INSERTs dos workspaces que rodam em paralelo e derrubam a gravacao
+    # com MetadataChangedException. Aplicados uma vez, na criacao, e qualquer
+    # conflito e engolido.
+    if not existed:
+        try:
+            _set_table_comment(
+                schema, "notebooks_secret_scan_results",
+                "TruffleHog secret scan results for Databricks notebooks. Identifies potential hardcoded secrets, API keys, "
+                "and credentials in notebook source code. When secrets_found=0 and other fields are NULL, it means the "
+                "workspace was scanned and no secrets were detected."
+            )
+            _set_column_comments(schema, "notebooks_secret_scan_results", {
+                "workspace_id":  "Databricks workspace ID where the notebook resides",
+                "notebook_id":   "Databricks notebook ID that was scanned",
+                "notebook_path": "Full workspace path to the scanned notebook",
+                "notebook_name": "Display name of the scanned notebook",
+                "detector_name": "TruffleHog detector that matched (e.g. AWS, Slack, GitHub, GitLab)",
+                "secret_sha256": "SHA-256 hash of the detected secret value — the actual secret is never stored",
+                "source_file":   "Source file within the notebook where the secret was detected",
+                "verified":      "True if TruffleHog confirmed the secret is currently active and valid",
+                "secrets_found": "Count of secrets detected. 0 with NULL other fields means the workspace was clean.",
+                "run_id":        "SAT secret scan run ID",
+                "scan_time":     "Timestamp when the scan was performed",
+                "scan_date":     "Date partition derived from scan_time",
+                "scan_hhmm":     "Hour and minute as integer (HHMM) derived from scan_time",
+            })
+        except Exception as exc:
+            print(f"notebooks_secret_scan_results comments skipped: {exc}")
 
 def create_clusters_secret_scan_results_table():
     schema = json_["analysis_schema_name"]
+    existed = spark.catalog.tableExists(f"{schema}.clusters_secret_scan_results")
     df = spark.sql(
         f"""CREATE TABLE IF NOT EXISTS {schema}.clusters_secret_scan_results (
         workspace_id STRING,
@@ -700,28 +741,340 @@ def create_clusters_secret_scan_results_table():
     PARTITIONED BY (scan_date)
     """
     )
-    _set_table_comment(
-        schema, "clusters_secret_scan_results",
-        "TruffleHog secret scan results for Databricks cluster configurations. Detects hardcoded secrets in Spark config, "
-        "environment variables, and init scripts. When secrets_found=0 and other fields are NULL, the workspace was "
-        "scanned and found clean."
+    # Comentarios sao metadados cosmeticos. Reaplicados a cada execucao, colidem
+    # com os INSERTs dos workspaces que rodam em paralelo e derrubam a gravacao
+    # com MetadataChangedException. Aplicados uma vez, na criacao, e qualquer
+    # conflito e engolido.
+    if not existed:
+        try:
+            _set_table_comment(
+                schema, "clusters_secret_scan_results",
+                "TruffleHog secret scan results for Databricks cluster configurations. Detects hardcoded secrets in Spark config, "
+                "environment variables, and init scripts. When secrets_found=0 and other fields are NULL, the workspace was "
+                "scanned and found clean."
+            )
+            _set_column_comments(schema, "clusters_secret_scan_results", {
+                "workspace_id":  "Databricks workspace ID where the cluster was found",
+                "cluster_id":    "Databricks cluster ID that was scanned",
+                "cluster_name":  "Display name of the scanned cluster",
+                "config_field":  "Cluster configuration section where the secret was found (e.g. spark_conf, env_vars)",
+                "config_key":    "Specific configuration key containing the potential secret",
+                "detector_name": "TruffleHog detector that matched (e.g. AWS, Slack, GitHub, GitLab)",
+                "secret_sha256": "SHA-256 hash of the detected secret value — the actual secret is never stored",
+                "source_file":   "Source location within the cluster config where the secret was detected",
+                "verified":      "True if TruffleHog confirmed the secret is currently active and valid",
+                "secrets_found": "Count of secrets detected. 0 with NULL other fields means the cluster config was clean.",
+                "run_id":        "SAT secret scan run ID",
+                "scan_time":     "Timestamp when the scan was performed",
+                "scan_date":     "Date partition derived from scan_time",
+                "scan_hhmm":     "Hour and minute as integer (HHMM) derived from scan_time",
+            })
+        except Exception as exc:
+            print(f"clusters_secret_scan_results comments skipped: {exc}")
+
+# COMMAND ----------
+
+
+def create_scan_exception_dispositions_table():
+    """Tratativas das excecoes do scan de segredos.
+
+    A tabela de excecoes diz o que nao foi escaneado. Esta diz o que foi
+    decidido a respeito: quem assumiu, ate quando, com que referencia. Sem ela,
+    os mesmos objetos reaparecem todo dia sem que ninguem saiba se ha alguem
+    cuidando — e o indicador vira ruido que se aprende a ignorar.
+
+    E escrita por pessoas, nao pelo job. O SAT so le.
+    """
+    schema = json_["analysis_schema_name"]
+    existed = spark.catalog.tableExists(f"{schema}.scan_exception_dispositions")
+    spark.sql(
+        f"""CREATE TABLE IF NOT EXISTS {schema}.scan_exception_dispositions (
+        disposition_id STRING,
+        escopo STRING,
+        escopo_valor STRING,
+        outcome STRING,
+        decisao STRING,
+        responsavel STRING,
+        referencia_externa STRING,
+        prazo DATE,
+        valido_ate DATE,
+        observacao STRING,
+        criado_por STRING,
+        criado_em TIMESTAMP,
+        ativo BOOLEAN
     )
-    _set_column_comments(schema, "clusters_secret_scan_results", {
-        "workspace_id":  "Databricks workspace ID where the cluster was found",
-        "cluster_id":    "Databricks cluster ID that was scanned",
-        "cluster_name":  "Display name of the scanned cluster",
-        "config_field":  "Cluster configuration section where the secret was found (e.g. spark_conf, env_vars)",
-        "config_key":    "Specific configuration key containing the potential secret",
-        "detector_name": "TruffleHog detector that matched (e.g. AWS, Slack, GitHub, GitLab)",
-        "secret_sha256": "SHA-256 hash of the detected secret value — the actual secret is never stored",
-        "source_file":   "Source location within the cluster config where the secret was detected",
-        "verified":      "True if TruffleHog confirmed the secret is currently active and valid",
-        "secrets_found": "Count of secrets detected. 0 with NULL other fields means the cluster config was clean.",
-        "run_id":        "SAT secret scan run ID",
-        "scan_time":     "Timestamp when the scan was performed",
-        "scan_date":     "Date partition derived from scan_time",
-        "scan_hhmm":     "Hour and minute as integer (HHMM) derived from scan_time",
-    })
+    USING DELTA
+    """
+    )
+    if not existed:
+        try:
+            _set_table_comment(
+                schema, "scan_exception_dispositions",
+                "Tratativas das excecoes do scan de segredos: o que foi decidido sobre cada objeto, pasta ou workspace "
+                "que nao pode ser escaneado. Preenchida por pessoas, nunca pelo job. A view "
+                "v_secret_scan_exceptions_tratadas cruza esta tabela com as excecoes e separa o que ja tem dono do que "
+                "esta pendente. Uma tratativa com valido_ate no passado deixa de valer e o item volta a aparecer como "
+                "pendente — aceite de risco tem prazo, senao vira exceção permanente por esquecimento."
+            )
+            _set_column_comments(schema, "scan_exception_dispositions", {
+                "disposition_id":     "Identificador da tratativa, livre (ex.: TRAT-2026-001)",
+                "escopo":             "Granularidade: 'objeto' (casa por object_id), 'pasta' (prefixo de caminho), 'workspace', ou 'processo'/'inventario' para pontos que nao apontam para nenhum arquivo",
+                "escopo_valor":       "Valor conforme o escopo: o object_id, o prefixo do caminho ou o workspace_id",
+                "outcome":            "Restringe a tratativa a um motivo especifico (ex.: access_denied). NULL vale para qualquer motivo",
+                "decisao":            "O que foi decidido: investigando, aguardando_acesso, em_remediacao, aceito, falso_positivo, fora_de_escopo",
+                "responsavel":        "Quem assumiu a tratativa",
+                "referencia_externa": "Chamado, e-mail ou solicitacao de acesso que amarra ao fluxo do banco",
+                "prazo":              "Data acordada para conclusao",
+                "valido_ate":         "Data em que a tratativa expira e o item volta a ser pendente. NULL nao expira — use com parcimonia",
+                "observacao":         "Contexto livre",
+                "criado_por":         "Quem registrou",
+                "criado_em":          "Quando foi registrada",
+                "ativo":              "False revoga a tratativa sem apagar o historico",
+            })
+        except Exception as exc:
+            print(f"scan_exception_dispositions comments skipped: {exc}")
+
+
+# COMMAND ----------
+
+
+def create_scan_reporting_views():
+    """Views de cobertura e excecoes do scan de segredos.
+
+    O dashboard, o SQL editor e qualquer analise posterior devem ler daqui, e nao
+    montar a propria juncao entre scan_discovery_stats e scan_object_events. Se a
+    regra mudar, muda em um lugar so.
+    """
+    schema = json_["analysis_schema_name"]
+    try:
+        # A view de tratativas referencia a tabela de dispositions; garante que
+        # exista antes, senao a view nasce quebrada num schema novo.
+        create_scan_exception_dispositions_table()
+
+        # Cobertura: o funil por execucao e workspace, com o percentual efetivo.
+        spark.sql(f"""
+            CREATE OR REPLACE VIEW {schema}.v_secret_scan_coverage AS
+            SELECT
+                workspace_id,
+                run_id,
+                source,
+                chk_date,
+                discovered,
+                filtered,
+                eligible,
+                scanned,
+                skipped_empty + skipped_binary AS skipped,
+                unscanned,
+                CASE WHEN eligible > 0
+                     THEN round(100.0 * scanned / eligible, 2)
+                     ELSE NULL END AS cobertura_pct,
+                status,
+                check_time
+            FROM (
+                SELECT *, row_number() OVER (
+                           PARTITION BY workspace_id, run_id, source
+                           ORDER BY check_time DESC) AS rn
+                FROM {schema}.scan_discovery_stats
+                WHERE filter_reason IS NULL
+            )
+            WHERE rn = 1
+        """)
+
+        # Excecoes: um objeto por linha, com o motivo agrupado em familias.
+        # access_denied e o unico que exige acao de alguem fora do SAT.
+        spark.sql(f"""
+            CREATE OR REPLACE VIEW {schema}.v_secret_scan_exceptions AS
+            SELECT
+                workspace_id,
+                run_id,
+                chk_date,
+                object_path,
+                object_id,
+                outcome,
+                CASE
+                    WHEN outcome = 'access_denied' THEN 'Sem permissao'
+                    WHEN outcome = 'stale_path' THEN 'Caminho mudou durante o scan'
+                    WHEN outcome IN ('export_failed', 'unexpected_status', 'error') THEN 'Erro de leitura'
+                    WHEN outcome IN ('empty', 'non_text') THEN 'Sem conteudo escaneavel'
+                    ELSE 'Outro'
+                END AS familia,
+                detail,
+                check_time
+            FROM {schema}.scan_object_events
+        """)
+
+        # Excecoes cruzadas com as tratativas. Uma excecao sem tratativa valida e
+        # PENDENTE; e o unico numero que exige acao. A tratativa casa por objeto,
+        # por prefixo de pasta ou por workspace, e expira em valido_ate.
+        spark.sql(f"""
+            CREATE OR REPLACE VIEW {schema}.v_secret_scan_exceptions_tratadas AS
+            SELECT
+                e.workspace_id,
+                e.run_id,
+                e.chk_date,
+                e.object_path,
+                e.object_id,
+                e.outcome,
+                e.detail,
+                d.disposition_id,
+                d.decisao,
+                d.responsavel,
+                d.referencia_externa,
+                d.prazo,
+                d.valido_ate,
+                CASE
+                    WHEN d.disposition_id IS NULL THEN 'PENDENTE'
+                    WHEN d.decisao IS NULL OR trim(d.decisao) = '' THEN 'AGUARDANDO DECISAO'
+                    WHEN d.valido_ate IS NOT NULL AND d.valido_ate < current_date() THEN 'TRATATIVA VENCIDA'
+                    WHEN d.prazo IS NOT NULL AND d.prazo < current_date()
+                         AND d.decisao IN ('investigando', 'aguardando_acesso', 'em_remediacao') THEN 'PRAZO ESTOURADO'
+                    ELSE 'TRATADO'
+                END AS situacao
+            FROM {schema}.scan_object_events e
+            LEFT JOIN {schema}.scan_exception_dispositions d
+              ON d.ativo = true
+             AND (d.outcome IS NULL OR d.outcome = e.outcome)
+             AND (
+                    (d.escopo = 'objeto'    AND d.escopo_valor = e.object_id)
+                 OR (d.escopo = 'pasta'     AND e.object_path LIKE concat(d.escopo_valor, '%'))
+                 OR (d.escopo = 'workspace' AND d.escopo_valor = e.workspace_id)
+                 )
+        """)
+
+        # Completude por execucao e por workspace. Substitui a falha do job: a
+        # execucao parcial nao para mais o pipeline, ela fica registrada aqui.
+        # O numero que exige acao nao e "unscanned > 0" — esse dispara em cima de
+        # excecao ja conhecida e vira ruido. E "excecoes_pendentes > 0": objeto
+        # nao lido que ninguem decidiu o que fazer. Evidencia perdida
+        # (findings_unwritten) e categoria a parte e mais grave: ali o segredo foi
+        # encontrado e o registro se perdeu, o que nenhuma tratativa cobre.
+        # SEM RASTRO existe porque a alternativa era mentir: unscanned maior que
+        # zero sem nenhum evento correspondente em scan_object_events nao prova
+        # tratativa, prova que o registro do evento falhou. Chamar isso de TRATADO
+        # seria trocar um falso positivo por um falso negativo, que e pior.
+        # EXECUCAO NAO CONCLUIDA vem da linha de abertura que o scan grava antes
+        # de comecar. A view nao distingue "rodando agora" de "morreu no meio" —
+        # ninguem consegue, olhando so a tabela. Quem separa os dois e o relogio:
+        # execucao aberta e nao fechada depois do job terminar foi interrompida.
+        # Sem essa linha, a execucao que morre no meio nao deixa registro nenhum,
+        # e ausencia de linha e o unico sinal que ninguem ve.
+        spark.sql(f"""
+            CREATE OR REPLACE VIEW {schema}.v_secret_scan_completude AS
+            SELECT
+                s.workspace_id,
+                s.run_id,
+                s.source,
+                s.chk_date,
+                s.check_time,
+                s.eligible,
+                s.scanned,
+                s.unscanned,
+                s.findings_attempted,
+                s.findings_unwritten,
+                CASE WHEN s.eligible > 0
+                     THEN round(100.0 * s.scanned / s.eligible, 2)
+                     ELSE NULL END AS cobertura_pct,
+                CASE
+                    WHEN s.status IS NOT NULL THEN s.status
+                    WHEN s.unscanned > 0 OR coalesce(s.findings_unwritten, 0) > 0 THEN 'INCOMPLETO'
+                    ELSE 'COMPLETO'
+                END AS status,
+                (SELECT count(DISTINCT t.object_id)
+                   FROM {schema}.v_secret_scan_exceptions_tratadas t
+                  WHERE t.workspace_id = s.workspace_id
+                    AND t.run_id = s.run_id
+                    AND t.outcome IN ('access_denied', 'export_failed', 'unexpected_status', 'error')
+                    AND t.situacao = 'PENDENTE') AS excecoes_pendentes,
+                (SELECT count(DISTINCT t.object_id)
+                   FROM {schema}.v_secret_scan_exceptions_tratadas t
+                  WHERE t.workspace_id = s.workspace_id
+                    AND t.run_id = s.run_id
+                    AND t.outcome IN ('access_denied', 'export_failed', 'unexpected_status', 'error')
+                    AND t.situacao <> 'PENDENTE') AS excecoes_com_tratativa,
+                CASE
+                    WHEN s.status = 'EM EXECUCAO' THEN 'EXECUCAO NAO CONCLUIDA'
+                    WHEN coalesce(s.findings_unwritten, 0) > 0 THEN 'EVIDENCIA PERDIDA'
+                    WHEN (SELECT count(DISTINCT t.object_id)
+                            FROM {schema}.v_secret_scan_exceptions_tratadas t
+                           WHERE t.workspace_id = s.workspace_id
+                             AND t.run_id = s.run_id
+                             AND t.outcome IN ('access_denied', 'export_failed', 'unexpected_status', 'error')
+                             AND t.situacao = 'PENDENTE') > 0 THEN 'INCOMPLETO PENDENTE'
+                    WHEN s.unscanned > 0
+                         AND (SELECT count(DISTINCT t.object_id)
+                                FROM {schema}.v_secret_scan_exceptions_tratadas t
+                               WHERE t.workspace_id = s.workspace_id
+                                 AND t.run_id = s.run_id
+                                 AND t.outcome IN ('access_denied', 'export_failed',
+                                                   'unexpected_status', 'error')) = 0
+                         THEN 'INCOMPLETO SEM RASTRO'
+                    WHEN s.unscanned > 0 THEN 'INCOMPLETO TRATADO'
+                    ELSE 'OK'
+                END AS veredito
+            FROM (
+                SELECT *, row_number() OVER (
+                           PARTITION BY workspace_id, run_id, source
+                           ORDER BY check_time DESC) AS rn
+                FROM {schema}.scan_discovery_stats
+                WHERE filter_reason IS NULL
+            ) s
+            WHERE s.rn = 1
+        """)
+
+        # Os pontos em si, independentemente de casarem com objetos. Pontos de
+        # processo e de inventario nao apontam para nenhum arquivo, mas precisam
+        # aparecer na mesma lista para a conversa com o cliente ser uma so.
+        spark.sql(f"""
+            CREATE OR REPLACE VIEW {schema}.v_pontos_tratativa AS
+            SELECT
+                d.disposition_id,
+                d.escopo,
+                d.escopo_valor,
+                d.outcome,
+                d.decisao,
+                d.responsavel,
+                d.referencia_externa,
+                d.prazo,
+                d.valido_ate,
+                d.observacao,
+                CASE
+                    WHEN d.decisao IS NULL OR trim(d.decisao) = '' THEN 'AGUARDANDO DECISAO'
+                    WHEN d.valido_ate IS NOT NULL AND d.valido_ate < current_date() THEN 'TRATATIVA VENCIDA'
+                    WHEN d.prazo IS NOT NULL AND d.prazo < current_date()
+                         AND d.decisao IN ('investigando', 'aguardando_acesso', 'em_remediacao') THEN 'PRAZO ESTOURADO'
+                    ELSE 'TRATADO'
+                END AS situacao,
+                (SELECT count(*) FROM {schema}.scan_object_events e
+                  WHERE (d.outcome IS NULL OR d.outcome = e.outcome)
+                    AND (
+                          (d.escopo = 'objeto'    AND d.escopo_valor = e.object_id)
+                       OR (d.escopo = 'pasta'     AND e.object_path LIKE concat(d.escopo_valor, '%'))
+                       OR (d.escopo = 'workspace' AND d.escopo_valor = e.workspace_id)
+                        )
+                ) AS objetos_afetados,
+                d.criado_por,
+                d.criado_em
+            FROM {schema}.scan_exception_dispositions d
+            WHERE d.ativo = true
+        """)
+
+        # Recorrencia: separa o que falha sempre do que falhou uma vez. E aqui que
+        # mora o sinal — problema cronico versus evento isolado.
+        spark.sql(f"""
+            CREATE OR REPLACE VIEW {schema}.v_secret_scan_exceptions_recorrentes AS
+            SELECT
+                workspace_id,
+                object_id,
+                max(object_path) AS ultimo_caminho,
+                outcome,
+                count(DISTINCT chk_date) AS dias_afetados,
+                min(chk_date) AS primeira_ocorrencia,
+                max(chk_date) AS ultima_ocorrencia
+            FROM {schema}.scan_object_events
+            GROUP BY workspace_id, object_id, outcome
+        """)
+    except Exception as exc:
+        print(f"scan reporting views skipped: {exc}")
 
 
 # COMMAND ----------
@@ -789,6 +1142,9 @@ def create_scan_discovery_stats_table():
         skipped_empty INT,
         skipped_binary INT,
         unscanned INT,
+        findings_attempted INT,
+        findings_unwritten INT,
+        status STRING,
         filter_reason STRING,
         filter_count INT,
         check_time TIMESTAMP,
@@ -798,6 +1154,25 @@ def create_scan_discovery_stats_table():
     PARTITIONED BY (chk_date)
     """
     )
+
+    # Tabela criada antes de a completude virar dado e trazida para a frente no
+    # lugar. Linhas antigas ficam com status NULL, que a view le como
+    # DESCONHECIDO: nao da para afirmar completude de uma execucao que nunca
+    # gravou o veredito.
+    if existed:
+        try:
+            cols = {f.name for f in spark.table(f"{schema}.scan_discovery_stats").schema.fields}
+            faltando = [
+                (nome, tipo) for nome, tipo in
+                (("findings_attempted", "INT"), ("findings_unwritten", "INT"), ("status", "STRING"))
+                if nome not in cols
+            ]
+            if faltando:
+                defs = ", ".join(f"{nome} {tipo}" for nome, tipo in faltando)
+                spark.sql(f"ALTER TABLE {schema}.scan_discovery_stats ADD COLUMNS ({defs})")
+        except Exception as exc:
+            print(f"scan_discovery_stats migration skipped: {exc}")
+
     if not existed:
         try:
             _set_table_comment(
@@ -817,7 +1192,10 @@ def create_scan_discovery_stats_table():
                 "scanned":        "Objetos efetivamente lidos e analisados pelo TruffleHog",
                 "skipped_empty":  "Objetos elegiveis que vieram sem conteudo no export",
                 "skipped_binary": "Objetos elegiveis cujo conteudo nao decodificou como texto",
-                "unscanned":      "Elegiveis que nao foram lidos por permissao, throttling ou falha de export. Maior que zero reprova a execucao",
+                "unscanned":      "Elegiveis que nao foram lidos por permissao, throttling ou falha de export. Maior que zero marca a execucao como INCOMPLETA, sem reprovar o job",
+                "findings_attempted": "Achados que o scan tentou gravar na tabela de resultados",
+                "findings_unwritten": "Achados que falharam ao gravar mesmo apos os retries. Maior que zero significa evidencia perdida",
+                "status":         "Veredito de completude da execucao no workspace: COMPLETO ou INCOMPLETO. Registrado como dado, nao como falha do job",
                 "filter_reason":  "Motivo do descarte: extensao (ex.: .parquet) ou trecho de caminho (ex.: /.git/). NULL na linha de resumo",
                 "filter_count":   "Quantidade descartada por esse motivo. NULL na linha de resumo",
                 "check_time":     "Momento do registro",
@@ -899,6 +1277,7 @@ def create_network_diagnostics_table():
 
 def create_workspace_run_complete_table():
     schema = json_["analysis_schema_name"]
+    existed = spark.catalog.tableExists(f"{schema}.workspace_run_complete")
     df = spark.sql(
         f"""CREATE TABLE IF NOT EXISTS {schema}.workspace_run_complete(
                     workspace_id string,
@@ -909,19 +1288,26 @@ def create_workspace_run_complete_table():
                     )
                     USING DELTA"""
     )
-    _set_table_comment(
-        schema, "workspace_run_complete",
-        "Tracks per-workspace completion status for each SAT run. Use to identify which workspaces completed "
-        "successfully and which failed in a given run. Join to run_number_table on run_id."
-    )
-    _set_column_comments(schema, "workspace_run_complete", {
-        "workspace_id": "Databricks workspace ID",
-        "run_id":       "SAT run ID — foreign key to run_number_table.runID",
-        "completed":    "True if the workspace analysis completed successfully in this run",
-        "check_time":   "Timestamp when the workspace analysis completed",
-        "chk_date":     "Date partition derived from check_time",
-    })
-
+    # Comentarios sao metadados cosmeticos. Reaplicados a cada execucao, colidem
+    # com os INSERTs dos workspaces que rodam em paralelo e derrubam a gravacao
+    # com MetadataChangedException. Aplicados uma vez, na criacao, e qualquer
+    # conflito e engolido.
+    if not existed:
+        try:
+            _set_table_comment(
+                schema, "workspace_run_complete",
+                "Tracks per-workspace completion status for each SAT run. Use to identify which workspaces completed "
+                "successfully and which failed in a given run. Join to run_number_table on run_id."
+            )
+            _set_column_comments(schema, "workspace_run_complete", {
+                "workspace_id": "Databricks workspace ID",
+                "run_id":       "SAT run ID — foreign key to run_number_table.runID",
+                "completed":    "True if the workspace analysis completed successfully in this run",
+                "check_time":   "Timestamp when the workspace analysis completed",
+                "chk_date":     "Date partition derived from check_time",
+            })
+        except Exception as exc:
+            print(f"workspace_run_complete comments skipped: {exc}")
 
 # COMMAND ----------
 
