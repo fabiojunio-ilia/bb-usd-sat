@@ -44,7 +44,7 @@ variables:
   secrets_max_parallel_workspaces:
     default: "4"
   driver_schedule:
-    default: "0 0 8 ? * Mon,Wed,Fri"
+    default: "0 0 8 ? * *"
   secrets_scanner_schedule:
     default: "0 0 10 ? * *"
   job_timezone:
@@ -149,8 +149,7 @@ targets:
       - level: CAN_MANAGE
         service_principal_name: ${var.run_as_sp}   # identidade que faz o deploy; explicita para nao depender de quem deploya
     presets:
-      name_prefix: "[canary] "      # paralelo ao SAT atual do BB
-      trigger_pause_status: PAUSED
+      name_prefix: "[SAT] "         # distingue dos jobs legados, que ficam pausados
     workspace:
       host: https://adb-7405606395020160.0.azuredatabricks.net
       root_path: /Applications/sat_canary
@@ -158,7 +157,7 @@ targets:
       service_principal_name: ${var.run_as_sp}
     variables:
       catalog: usd_prd
-      analysis_schema: analysis_canary   # schema proprio do canary (nao toca o SAT atual)
+      analysis_schema: analysis_schema   # schema oficial do SAT
       run_as_sp: "1eff7c5e-75cd-47c6-accf-febf25889c70"   # SP de prd do BB
       spark_version: "16.4.x-scala2.12"
       node_type_id: "Standard_DS4_v2"

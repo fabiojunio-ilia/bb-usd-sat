@@ -780,9 +780,13 @@ def discover_notebooks_via_workspace_list(time_filter_enabled: bool,
     """Fallback notebook discovery using /workspace/list (+ /get-status only when needed).
 
     Used when /search-midtier/unified-search rejects token-based auth
-    (returns 403). See GitHub issue #330 for context. The standard
-    discoverable trees — /Users, /Shared, /Repos — cover the common cases;
-    missing roots are tolerated silently (404).
+    (returns 403). See GitHub issue #330 for context.
+
+    As raizes vem de um /workspace/list na raiz, nao de uma lista fixa. A lista
+    fixa (/Users, /Shared, /Repos) deixava de fora qualquer arvore que o
+    workspace tivesse alem dessas tres, e o objeto simplesmente nao aparecia:
+    nem como lido, nem como excecao. Perguntar a raiz cobre o que existe hoje e
+    o que for criado depois, sem exigir alteracao de codigo.
 
     Performance: directory traversal is fanned out across a thread pool one
     level at a time instead of recursing serially, and the per-leaf
@@ -795,7 +799,18 @@ def discover_notebooks_via_workspace_list(time_filter_enabled: bool,
 
     # Phase 1: parallel breadth-first directory traversal.
     leaves: List[Dict[str, Any]] = []
-    pending: List[str] = ["/Users", "/Shared", "/Repos"]
+
+    # Raizes descobertas, nao presumidas. Se a raiz nao responder, cai para as
+    # tres arvores historicas para nao ficar sem nenhuma origem.
+    raizes = [o["path"] for o in _list_dir("/")
+              if o.get("path") and o.get("object_type") in ("DIRECTORY", "REPO")]
+    if not raizes:
+        logger.warning("workspace/list na raiz nao devolveu diretorios; usando as raizes padrao")
+        raizes = ["/Users", "/Shared", "/Repos"]
+    logger.info(f"Raizes descobertas para a varredura: {raizes}")
+    print(f"🌳 Raizes descobertas: {', '.join(raizes)}")
+
+    pending: List[str] = raizes
     with concurrent.futures.ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as pool:
         while pending:
             next_dirs: List[str] = []
@@ -1472,7 +1487,12 @@ def _materialize_notebook(notebook: Dict[str, Any], scan_dir: str) -> Optional[T
         return None
 
     temp_path = f"{parent_path}/{notebook_name}"
-    path = quote(temp_path)
+    # O caminho segue cru daqui para frente. get_fuse_path monta um caminho de
+    # filesystem, e check_notebook_status/export_notebook_content ja aplicam
+    # quote() ao montar a URL. Encodar aqui gerava %2520 na chamada da API: um
+    # 404 falso registrado como stale_path, e o notebook sumia do relatorio sem
+    # aparecer como problema. Atingia todo caminho com espaco ou acento.
+    path = temp_path
     metadata = {"object_id": notebook_id, "path": path, "name": notebook_name}
     scan_file = os.path.join(scan_dir, str(notebook_id))
 

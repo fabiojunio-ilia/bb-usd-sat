@@ -850,6 +850,13 @@ def create_scan_reporting_views():
         # A view de tratativas referencia a tabela de dispositions; garante que
         # exista antes, senao a view nasce quebrada num schema novo.
         create_scan_exception_dispositions_table()
+        # As views abaixo leem scan_object_events e scan_discovery_stats. Num schema
+        # novo essas tabelas ainda nao existem quando esta funcao roda: o registro de
+        # eventos retorna cedo quando a execucao foi limpa, e a criacao ficaria para
+        # depois. Sem estas duas linhas a primeira view que le scan_object_events
+        # falha com TABLE_OR_VIEW_NOT_FOUND e derruba todas as seguintes.
+        create_scan_object_events_table()
+        create_scan_discovery_stats_table()
 
         # Cobertura: o funil por execucao e workspace, com o percentual efetivo.
         spark.sql(f"""
