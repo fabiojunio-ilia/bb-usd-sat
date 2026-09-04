@@ -96,6 +96,11 @@ targets:
   # ---------------- BB DEV: classico (workspace de dev do BB) ----------------
   bb_dev:
     mode: production
+    permissions:
+      - level: CAN_MANAGE
+        group_name: SLNUSDLG      # mesmo grupo de prd; sem isto os jobs so aparecem para o SP que deploya
+      - level: CAN_MANAGE
+        service_principal_name: ${var.run_as_sp}
     presets:
       trigger_pause_status: PAUSED   # dispara manual no dev; sem prefixo canary (vai substituir o SAT de dev)
     workspace:
