@@ -25,6 +25,12 @@ variables:
   analysis_schema:
     description: Schema do SAT dentro do catalogo.
     default: analysis_schema
+  sql_warehouse_id:
+    description: >
+      Warehouse do dashboard gerenciado pelo bundle. Mesmo valor da chave
+      sql-warehouse-id do secret scope sat_scope; nao e segredo. Preencher por
+      target antes do deploy do dashboard.
+    default: ""
   # Compute (usadas so no target classico/prd)
   run_as_sp:
     default: ""

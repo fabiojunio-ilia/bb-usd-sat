@@ -1,0 +1,14 @@
+# Dashboard do SAT gerenciado pelo bundle (fonte de verdade: o JSON versionado).
+# dataset_catalog/dataset_schema reescrevem no deploy as referencias hardcoded
+# `sat.security_analysis` dos datasets, substituindo o replace manual que o
+# notebook "5. import_dashboard_template_lakeview" fazia (o notebook fica como
+# fallback e sai cedo quando dashboard_managed_by_bundle=true).
+resources:
+  dashboards:
+    sat_dashboard:
+      display_name: "Security Analysis Tool [SAT]"
+      file_path: ../dashboards/SAT_Dashboard_definition.json
+      warehouse_id: ${var.sql_warehouse_id}
+      dataset_catalog: ${var.catalog}
+      dataset_schema: ${var.analysis_schema}
+      embed_credentials: true

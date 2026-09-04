@@ -201,17 +201,19 @@ def _bundle_param(name):
 _ov = {k: _bundle_param(k) for k in (
     "analysis_schema_name", "maxpages", "timebetweencalls",
     "use_parallel_runs", "secrets_max_parallel_workspaces",
+    "dashboard_managed_by_bundle",
 )}
 for _k, _v in _ov.items():
     if _v is not None:
         json_[_k] = _v
 
-# widgets chegam como string: converte os numericos e o booleano
+# widgets chegam como string: converte os numericos e os booleanos
 for _k in ("maxpages", "timebetweencalls", "secrets_max_parallel_workspaces"):
     if isinstance(json_.get(_k), str):
         json_[_k] = int(json_[_k])
-if isinstance(json_.get("use_parallel_runs"), str):
-    json_["use_parallel_runs"] = json_["use_parallel_runs"].strip().lower() == "true"
+for _k in ("use_parallel_runs", "dashboard_managed_by_bundle"):
+    if isinstance(json_.get(_k), str):
+        json_[_k] = json_[_k].strip().lower() == "true"
 
 # re-deriva o intermediate_schema caso o catalogo/schema tenha mudado.
 # Usa a mesma funcao da primeira derivacao: duas formulas separadas ja fizeram

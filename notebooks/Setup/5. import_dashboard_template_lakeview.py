@@ -17,6 +17,17 @@
 
 # COMMAND ----------
 
+# O dashboard passou a ser recurso do bundle (resources/sat_dashboard.dashboard.yml),
+# com dataset_catalog/dataset_schema fazendo no deploy a troca de schema que este
+# notebook fazia por replace. Dois donos do mesmo dashboard geram sobrescrita e
+# delecao cruzada, entao quando o bundle gerencia, este notebook nao faz nada.
+# Execucao interativa sem o parametro segue no fluxo antigo (fallback).
+if json_.get("dashboard_managed_by_bundle"):
+    print("Dashboard gerenciado pelo bundle; import via notebook desativado.")
+    dbutils.notebook.exit('OK')
+
+# COMMAND ----------
+
 dfexist = readWorkspaceConfigFile()
 dfexist.filter((dfexist.analysis_enabled==True) & (dfexist.connection_test==True)).createOrReplaceTempView('all_workspaces') 
 

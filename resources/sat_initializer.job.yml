@@ -14,3 +14,6 @@ resources:
               timebetweencalls: "${var.timebetweencalls}"
               use_parallel_runs: "${var.use_parallel_runs}"
               secrets_max_parallel_workspaces: "${var.secrets_max_parallel_workspaces}"
+              # O dashboard e recurso do bundle (resources/sat_dashboard.dashboard.yml);
+              # o notebook 5 do initializer vira no-op quando true.
+              dashboard_managed_by_bundle: "true"

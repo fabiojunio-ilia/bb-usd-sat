@@ -37,7 +37,8 @@ cloud_type = getCloudType(hostname)
 # scope e podem escrever no schema errado (ex.: schema de producao em vez do canary).
 _child_args = {
     k: str(json_[k])
-    for k in ("analysis_schema_name", "maxpages", "timebetweencalls", "use_parallel_runs")
+    for k in ("analysis_schema_name", "maxpages", "timebetweencalls",
+              "use_parallel_runs", "dashboard_managed_by_bundle")
     if k in json_
 }
 
