@@ -106,6 +106,7 @@ targets:
     variables:
       catalog: usd_des                # catalogo do DEV do BB
       analysis_schema: analysis_schema
+      sql_warehouse_id: "c15a4f12ae8d84ba"   # mesmo valor do scope sat_scope/sql-warehouse-id
       run_as_sp: "40df3399-4034-4690-8d17-a67031821dc2"   # SP do dev do BB
       spark_version: "16.4.x-scala2.12"
       node_type_id: "Standard_DS4_v2"
@@ -164,6 +165,7 @@ targets:
     variables:
       catalog: usd_prd
       analysis_schema: analysis_schema   # schema oficial do SAT
+      sql_warehouse_id: "3e013a69359f8e87"   # mesmo valor do scope sat_scope/sql-warehouse-id
       run_as_sp: "1eff7c5e-75cd-47c6-accf-febf25889c70"   # SP de prd do BB
       spark_version: "16.4.x-scala2.12"
       node_type_id: "Standard_DS4_v2"
