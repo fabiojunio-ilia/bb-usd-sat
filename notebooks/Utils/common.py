@@ -169,11 +169,21 @@ _FLUSH_THRESHOLD = 200
 
 
 def _get_run_id():
+    # O run_id da sessao chega no json_, alocado uma vez pelo notebook raiz.
+    # Reler max(runID) aqui era uma corrida: o scanner de secrets insere na
+    # mesma run_number_table, e o max no momento da leitura podia pertencer a
+    # outra sessao. Checks e workspace_run_complete saiam com ids divergentes
+    # e o dashboard nao encontrava os dados. O max fica so como fallback de
+    # execucao interativa, onde nenhum id foi alocado.
     global _cached_run_id
     if _cached_run_id is None:
-        _cached_run_id = spark.sql(
-            f'select max(runID) from {json_["analysis_schema_name"]}.run_number_table'
-        ).collect()[0][0]
+        session_run_id = json_.get("run_id")
+        if session_run_id is not None:
+            _cached_run_id = int(session_run_id)
+        else:
+            _cached_run_id = spark.sql(
+                f'select max(runID) from {json_["analysis_schema_name"]}.run_number_table'
+            ).collect()[0][0]
     return _cached_run_id
 
 
@@ -511,12 +521,23 @@ def create_schema():
 
 
 def insertNewBatchRun():
+    """Aloca um run_id novo e o devolve.
+
+    O id volta pelo check_time exato do INSERT, nao por max(runID): o scanner
+    de secrets insere na mesma tabela e um max lido depois pode ser de outra
+    sessao. O chamador deve guardar o retorno em json_["run_id"] para que os
+    filhos e o notifyworkspaceCompleted carimbem todos o mesmo id.
+    """
     import time
 
     ts = time.time()
-    df = spark.sql(
+    spark.sql(
         f'insert into {json_["analysis_schema_name"]}.run_number_table (check_time) values ({ts})'
     )
+    return spark.sql(
+        f'select max(runID) from {json_["analysis_schema_name"]}.run_number_table '
+        f'where check_time = cast({ts} as timestamp)'
+    ).collect()[0][0]
 
 
 # COMMAND ----------
@@ -526,9 +547,11 @@ def notifyworkspaceCompleted(workspaceID, completed):
     import time
 
     ts = time.time()
-    runID = spark.sql(
-        f'select max(runID) from {json_["analysis_schema_name"]}.run_number_table'
-    ).collect()[0][0]
+    # Mesmo id que os checks: o da sessao (json_["run_id"] via _get_run_id).
+    # O max(runID) lido aqui, no fim da analise, ja chegou a divergir do id
+    # carimbado nos checks quando o scanner inseriu no meio; o dashboard
+    # buscava os checks pelo id da workspace_run_complete e nao achava nada.
+    runID = _get_run_id()
     spark.sql(
         f"""INSERT INTO {json_["analysis_schema_name"]}.workspace_run_complete (`workspace_id`,`run_id`, `completed`, `check_time`)  VALUES ({workspaceID}, {runID}, {completed}, cast({ts} as timestamp))"""
     )

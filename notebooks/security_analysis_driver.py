@@ -101,7 +101,14 @@ if workspaces is None or len(workspaces) == 0:
 
 # COMMAND ----------
 
-insertNewBatchRun()
+# Um run_id por sessao do driver, carimbado em tudo desta execucao. Vai no
+# json_ para os notebooks filhos (que copiam o dict em ws_json) e para o
+# notifyworkspaceCompleted, todos via _get_run_id. Sem isso cada consumidor
+# relia max(runID) num momento diferente e o scanner de secrets, inserindo na
+# mesma tabela, fazia checks e workspace_run_complete divergirem de id.
+session_run_id = insertNewBatchRun()
+json_["run_id"] = int(session_run_id)
+loggr.info(f"run_id da sessao do driver: {session_run_id}")
 
 
 def processWorkspace(wsrow):
