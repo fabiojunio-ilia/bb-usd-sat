@@ -164,7 +164,7 @@ targets:
       name_prefix: "[SAT] "         # distingue dos jobs legados, que ficam pausados
     workspace:
       host: https://adb-7405606395020160.0.azuredatabricks.net
-      root_path: /Applications/sat_canary
+      root_path: /Applications/${bundle.name}
     run_as:
       service_principal_name: ${var.run_as_sp}
     variables:
@@ -176,6 +176,12 @@ targets:
       node_type_id: "Standard_DS4_v2"
       num_workers: 3
     resources:
+      dashboards:
+        sat_dashboard:
+          # O name_prefix do preset tambem prefixa dashboards; sem este override
+          # o nome final seria "[SAT] Security Analysis Tool [SAT]". Com ele,
+          # o dashboard publicado fica "[SAT] Security Analysis Tool".
+          display_name: "Security Analysis Tool"
       jobs:
         sat_initializer:
           tasks:
