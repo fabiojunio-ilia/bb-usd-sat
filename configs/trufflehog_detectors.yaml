@@ -72,7 +72,10 @@ settings:
 
   search_settings:
     page_size: 50
-    days_back: 1  # Janela da descoberta, em dias. 1 = incremental diario (so o que
+    days_back: 0  # TEMPORARIO (2026-09-08): varredura base pos-fix do token para
+                  # cobrir o acervo completo (ws 2030: 8,3 mil objetos nunca lidos,
+                  # inclusive os .json com segredo). REVERTER para 1 apos o run.
+                  # Janela da descoberta, em dias. 1 = incremental diario (so o que
                   # mudou desde a meia-noite UTC de ontem). 0 = varredura completa do
                   # acervo, sem filtro de tempo: volume e duracao sobem em ordens de
                   # grandeza e o job tem timeout de 8h. Voltar para 1 apos a varredura.
