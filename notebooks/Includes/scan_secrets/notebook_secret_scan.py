@@ -538,6 +538,36 @@ except Exception as e:
     logger.error(f"Failed to extract Databricks context: {str(e)}")
     raise
 
+# O token AAD da SP vale ~60 minutos e era obtido uma unica vez. Num workspace
+# grande a descoberta sozinha consome essa vida util e a leitura inteira morre
+# com "Token is expired" (observado: 8,3 mil objetos elegiveis, zero lidos).
+# Renovacao sob demanda: quando uma resposta indica expiracao, UMA thread
+# renova via db_client e as demais reaproveitam; o lock e a janela de 60 s
+# evitam tempestade de renovacao com MAX_WORKERS threads simultaneas.
+import threading
+_token_lock = threading.Lock()
+_token_refreshed_at = time.time()
+
+
+def refresh_expired_token() -> None:
+    global token, _token_refreshed_at
+    with _token_lock:
+        if time.time() - _token_refreshed_at < 60:
+            return
+        novo = db_client.get_temporary_oauth_token()
+        if novo:
+            token = novo
+            _token_refreshed_at = time.time()
+            logger.info("Bearer token renovado apos expiracao")
+        else:
+            logger.error("Falha ao renovar o bearer token")
+
+
+def _looks_token_expired(response) -> bool:
+    if response.status_code not in (401, 403):
+        return False
+    return "expir" in (response.text or "").lower()
+
 # Create temporary directories if they don't exist
 os.makedirs(Config.TEMP_NOTEBOOKS_DIR, exist_ok=True)
 logger.info(f"Temporary directory created: {Config.TEMP_NOTEBOOKS_DIR}")
@@ -677,14 +707,25 @@ def _get_with_retry(url: str, what: str) -> Optional[requests.Response]:
         Optional[requests.Response]: Response, or None if the request never
             reached the server
     """
-    headers = {"Authorization": f"Bearer {token}", "User-Agent": "databricks-sat/0.1.0"}
     max_attempts = 5
     for attempt in range(max_attempts):
+        # Headers montados a cada tentativa: apos um refresh_expired_token()
+        # o global `token` muda, e um dict montado antes do loop continuaria
+        # carregando o bearer morto.
+        headers = {"Authorization": f"Bearer {token}", "User-Agent": "databricks-sat/0.1.0"}
         try:
             response = requests.get(url, headers=headers, timeout=30)
         except requests.exceptions.RequestException as e:
             logger.error(f"Request error during {what}: {str(e)}")
             return None
+
+        if _looks_token_expired(response):
+            if attempt == max_attempts - 1:
+                logger.error(f"Token expirado e nao renovado apos {max_attempts} tentativas during {what}")
+                return response
+            logger.warning(f"Token expirado durante {what}; renovando e repetindo")
+            refresh_expired_token()
+            continue
 
         if response.status_code != 429:
             return response
@@ -1757,6 +1798,10 @@ def main_scanning_workflow():
                 data["page_token"] = next_page_token
             elif "page_token" in data:
                 del data["page_token"]  # Remove token for first request
+
+            # O scan das paginas anteriores pode ter renovado o token global;
+            # reflete o bearer atual em vez do capturado antes do loop.
+            headers["Authorization"] = f"Bearer {token}"
 
             # Make API request
             response, status_code = make_api_request(url, headers, data)
