@@ -1803,8 +1803,19 @@ def main_scanning_workflow():
             # reflete o bearer atual em vez do capturado antes do loop.
             headers["Authorization"] = f"Bearer {token}"
 
-            # Make API request
-            response, status_code = make_api_request(url, headers, data)
+            # Varredura base (days_back=0): caminhada pela raiz SEMPRE, sem
+            # consultar o indice. O unified-search devolve o que esta indexado,
+            # nao o que existe: numa base medida, o indice devolveu ~7,6 mil
+            # objetos e a caminhada 9,4 mil no mesmo workspace, e os arquivos
+            # com segredo da rodada 2026-09-03 estavam justamente na diferenca.
+            # Censo e inventario do que existe; indice fica para o incremental.
+            if not time_filter_enabled and page_number == 1:
+                logger.info("Base scan (days_back=0): forcando descoberta por workspace/list (censo)")
+                print("🧭 Varredura base: descoberta pela caminhada da raiz (indice ignorado).")
+                response, status_code = None, 403  # reaproveita o caminho de fallback abaixo
+            else:
+                # Make API request
+                response, status_code = make_api_request(url, headers, data)
 
             # /search-midtier/unified-search rejects token-based auth on
             # workspaces where the endpoint is browser-only. See GitHub
